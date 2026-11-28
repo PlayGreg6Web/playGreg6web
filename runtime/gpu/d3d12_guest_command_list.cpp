@@ -1200,6 +1200,9 @@ bool emit_gpu_texture_subresource_copy(Device& dev, const TextureCopyPlan& plan,
         }
         enc.draw(3, 1, 0, pack_signed_delta_i16(dx, dy));
         enc.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+        // The group is single-use (one per copy): the executor resolved it at SetBindGroup2, so
+        // destroying it now frees the Dawn bind group and prunes its journaled create packet.
+        enc.destroy_resource(group_id);
         return true;
     }
 
@@ -1348,6 +1351,7 @@ bool emit_gpu_texture_subresource_copy(Device& dev, const TextureCopyPlan& plan,
     const uint32_t gy = (spec.height + wg_xy - 1u) / wg_xy;
     const uint32_t gz = plan.is_3d ? (spec.depth + 3u) / 4u : 1u;
     enc.dispatch_compute(gx, gy, gz);
+    enc.destroy_resource(group_id);  // single-use group (see the render path)
     return true;
 }
 

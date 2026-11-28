@@ -3145,9 +3145,12 @@ size_t BindGroupCache::evict_resources_and_views(std::span<const uint32_t> resou
     return dropped;
 }
 
-size_t BindGroupCache::end_epoch(size_t max_entries, std::vector<uint32_t>* retired) {
+size_t BindGroupCache::end_epoch(size_t max_entries, std::vector<uint32_t>* retired, size_t trim_over) {
     size_t dropped = 0;
-    if (size_ > max_entries) {
+    if (trim_over > max_entries) {
+        trim_over = max_entries;
+    }
+    if (size_ > trim_over) {
         for (Slot& s : table_) {
             if (s.state == kBindSlotOccupied && s.entry->last_used_epoch < epoch_) {
                 if (retired != nullptr && s.entry->gpu_id != 0) {

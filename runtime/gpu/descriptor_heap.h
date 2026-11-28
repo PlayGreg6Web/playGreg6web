@@ -1152,7 +1152,10 @@ public:
     // the entries the current epoch did not use, then everything if still above the bound; the gpu
     // ids of dropped entries go to `retired`. Then starts a new epoch. Only call it when no open
     // recording references the entries (command-list Reset). Returns the number dropped.
-    size_t end_epoch(size_t max_entries, std::vector<uint32_t>* retired);
+    // `trim_over` (default: max_entries) is the size above which the entries the epoch did not use are
+    // dropped; the clear-everything fallback still only triggers above `max_entries`. A lower trim_over
+    // under process-wide pressure shrinks idle caches without thrashing the ones in use.
+    size_t end_epoch(size_t max_entries, std::vector<uint32_t>* retired, size_t trim_over = SIZE_MAX);
     uint64_t epoch() const noexcept { return epoch_; }
     // Tables in heaps the source reads come from descriptor memory (nullptr: registry only).
     void set_slot_source(const DescriptorSlotSource* source) noexcept { slot_source_ = source; }

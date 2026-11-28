@@ -343,6 +343,12 @@ inline constexpr uint64_t kUniformOffsetAlignment = 256;
 inline constexpr uint64_t kMaxUniformBindingSize = 65536;
 // Bind groups one command list keeps cached across Resets (O36); see CommandListBridge::Reset.
 inline constexpr size_t kMaxCachedBindGroups = 4096;
+// Process-wide bound on cached bind groups over every command list (#2203): each list is bounded to
+// kMaxCachedBindGroups on its own, but a title with many lists multiplied that into ~100k live Dawn
+// bind groups. Above this total a list's Reset also drops the entries its last epoch did not use
+// once the list holds more than kPressureCachedBindGroups.
+inline constexpr uint64_t kGlobalCachedBindGroups = 24576;
+inline constexpr size_t kPressureCachedBindGroups = 256;
 
 // O36 / backlog 28: process-wide gauges of live bridge-side objects (every StateBridgeDevice and
 // command list), for the boot report and the plateau check of a long run.

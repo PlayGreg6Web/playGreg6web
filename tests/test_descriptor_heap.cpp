@@ -1311,6 +1311,21 @@ void test_heap_indexed_bind_groups() {
         CHECK(cache.end_epoch(0, &retired) == 1 && cache.size() == 0);
         CHECK(std::find(retired.begin(), retired.end(), 99u) != retired.end());
     }
+    // #2203 pressure trim: with trim_over below the size, the unused entries are dropped even though
+    // the cache is under max_entries, and the entries the epoch used survive.
+    {
+        std::vector<uint32_t> retired;
+        cache.end_epoch(1000, &retired);  // new epoch, nothing used in it yet
+        CHECK(st.set_root_constants(G, 0, 2, k1, 0) == Status::Ok);
+        BindGroupLookup used = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
+        CHECK(used.bind_group != nullptr);
+        const size_t cached = cache.size();
+        CHECK(cached >= 1);
+        cache.end_epoch(1000, &retired, 0);
+        CHECK(cache.size() == 1 && used.bind_group != nullptr);
+        cache.end_epoch(0, &retired);
+        CHECK(cache.size() == 0);
+    }
     // Backlog 28: the live-entry gauge follows the cache through insert, eviction and clear.
     {
         const uint64_t others = descriptor_live_counts().cached_bind_groups - cache.size();

@@ -3711,7 +3711,8 @@ void CommandListBridge::Reset(GraphicsPipelineState* initial_state) {
             device_.take_deferred_destroy(bg_id, encoder_);
         }
         std::vector<uint32_t> evicted;
-        bind_groups_.end_epoch(kMaxCachedBindGroups, &evicted);
+        const bool pressure = d3d::descriptor_live_counts().cached_bind_groups > kGlobalCachedBindGroups;
+        bind_groups_.end_epoch(kMaxCachedBindGroups, &evicted, pressure ? kPressureCachedBindGroups : kMaxCachedBindGroups);
         for (const uint32_t id : evicted) {
             redirects_.erase(id);
             device_.destroy_or_defer_resource(id, encoder_);
