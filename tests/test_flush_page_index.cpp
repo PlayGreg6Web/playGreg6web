@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <vector>
 
 #include "gpu/flush_page_index.h"
@@ -183,12 +184,29 @@ void test_cover_and_merge() {
 std::vector<const void*> ref_pages(const std::vector<std::pair<const void*, Range>>& m, const std::vector<uintptr_t>& pages,
                                    uintptr_t page_bytes) {
     std::vector<const void*> out;
+    if (page_bytes == 0) {
+        return out;
+    }
     for (const auto& [k, r] : m) {
         for (uintptr_t p : pages) {
-            if (r.first < p + page_bytes && p < r.second) {
+            if ((r.first < p || (r.first - p) < page_bytes) && p < r.second) {
                 out.push_back(k);
                 break;
             }
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::vector<const void*> ref_range(const std::vector<std::pair<const void*, Range>>& m, uintptr_t lo, uintptr_t hi) {
+    std::vector<const void*> out;
+    if (hi <= lo) {
+        return out;
+    }
+    for (const auto& [k, r] : m) {
+        if (r.first < hi && lo < r.second) {
+            out.push_back(k);
         }
     }
     std::sort(out.begin(), out.end());
@@ -333,6 +351,311 @@ void test_page_edges_exact() {
     CHECK(ranges_cover(r, 10, 30) && !ranges_cover(r, 4, 11));
 }
 
+// Repeated collect_pages / collect_range calls must reset generation-based deduplication cleanly
+// across calls, never drop keys on subsequent queries, and preserve existing elements in `out`.
+void test_repeated_queries_and_dedup_reset() {
+    HostPageIndex idx;
+    idx.add(K(0), kBase, kBase + 4 * k64K);                       // spans 4 granules
+    idx.add(K(1), kBase + k64K - kPage, kBase + 2 * k64K + 128);  // straddles granules 0, 1, 2
+    idx.add(K(2), kBase + 2 * k64K + 0x100, kBase + 2 * k64K + 0x200);
+    idx.add(K(3), kBase + 100 * k64K, kBase + 103 * k64K);
+
+    const std::vector<uintptr_t> multi_granule_pages = {
+        kBase + 0x1000,
+        kBase + k64K - kPage,
+        kBase + k64K + 0x2000,
+        kBase + 2 * k64K,
+    };
+    const auto want_pages = sorted({K(0), K(1), K(2)});
+    const auto want_narrow = sorted({K(0), K(1), K(2)});
+    const auto want_single = sorted({K(0), K(1)});
+    const auto want_wide = sorted({K(0), K(1), K(2), K(3)});
+
+    std::vector<const void*> out;
+    for (int iter = 0; iter < 64; ++iter) {
+        out.clear();
+        idx.collect_pages(multi_granule_pages, kPage, &out);
+        CHECK(out.size() == want_pages.size());
+        CHECK(sorted(out) == want_pages);
+
+        out.clear();
+        idx.collect_range(kBase + k64K, kBase + k64K + kPage, &out);  // single granule
+        CHECK(out.size() == want_single.size());
+        CHECK(sorted(out) == want_single);
+
+        out.clear();
+        idx.collect_range(kBase + 0x2000, kBase + 3 * k64K, &out);  // narrow multi-granule
+        CHECK(out.size() == want_narrow.size());
+        CHECK(sorted(out) == want_narrow);
+
+        out.clear();
+        idx.collect_range(kBase, kBase + 105 * k64K, &out);  // wide (> 64 granules)
+        CHECK(out.size() == want_wide.size());
+        CHECK(sorted(out) == want_wide);
+    }
+
+    // Empty pages and zero page_bytes are no-ops and do not affect subsequent queries.
+    out.clear();
+    idx.collect_pages({}, kPage, &out);
+    idx.collect_pages(multi_granule_pages, 0, &out);
+    CHECK(out.empty());
+
+    // Appending to a non-empty `out` preserves pre-existing entries.
+    out.push_back(K(15));
+    idx.collect_pages({kBase + 101 * k64K}, kPage, &out);
+    CHECK(out.size() == 2 && out[0] == K(15) && out[1] == K(3));
+}
+
+// Large-range collect_range (> 64 granules) vs narrow-range collect_range (1..64 granules), plus
+// multi-granule page sizes (both <= 64 granules and > 64 granules per page).
+void test_large_vs_narrow_range_and_multi_granule_pages() {
+    HostPageIndex idx;
+    std::vector<std::pair<const void*, Range>> model;
+    auto put = [&](const void* k, uintptr_t lo, uintptr_t hi) {
+        idx.add(k, lo, hi);
+        model.emplace_back(k, Range(lo, hi));
+    };
+
+    put(K(0), kBase + 0x100, kBase + 0x900);
+    put(K(1), kBase + 1 * k64K - 16, kBase + 3 * k64K + 16);
+    put(K(2), kBase + 32 * k64K + 0x2000, kBase + 33 * k64K + 0x4000);
+    put(K(3), kBase + 64 * k64K, kBase + 65 * k64K);
+    put(K(4), kBase + 65 * k64K + 0x100, kBase + 70 * k64K + 0x100);
+    put(K(5), kBase + 130 * k64K + 0x5000, kBase + 131 * k64K);
+    put(K(6), kBase + 195 * k64K, kBase + 200 * k64K);
+
+    // Narrow single-granule, exact 64-granule boundary, 65-granule boundary, and 210-granule spans.
+    const std::vector<Range> queries = {
+        {kBase + 0x200, kBase + 0x300},
+        {kBase + 2 * k64K, kBase + 2 * k64K + 1},
+        {kBase, kBase + 64 * k64K},
+        {kBase, kBase + 65 * k64K},
+        {kBase + 64 * k64K, kBase + 135 * k64K},
+        {kBase, kBase + 210 * k64K},
+        {kBase + 70 * k64K + 0x100, kBase + 130 * k64K + 0x5000},  // gap between K(4) and K(5)
+    };
+    for (const Range& q : queries) {
+        std::vector<const void*> got;
+        idx.collect_range(q.first, q.second, &got);
+        std::sort(got.begin(), got.end());
+        CHECK(std::adjacent_find(got.begin(), got.end()) == got.end());
+        CHECK(got == ref_range(model, q.first, q.second));
+    }
+
+    // Multi-granule page_bytes: 128 KiB (2 granules), 256 KiB (4 granules), and 8 MiB (128 granules > 64).
+    for (const uintptr_t pg : {2 * k64K, 4 * k64K, 128 * k64K}) {
+        const std::vector<uintptr_t> pages = {
+            kBase,
+            kBase + pg,
+            kBase + 3 * pg,
+        };
+        std::vector<const void*> got;
+        idx.collect_pages(pages, pg, &got);
+        std::sort(got.begin(), got.end());
+        CHECK(std::adjacent_find(got.begin(), got.end()) == got.end());
+        CHECK(got == ref_pages(model, pages, pg));
+    }
+}
+
+// Swap-and-pop removal integrity in a crowded granule, same-granule and cross-granule re-keying,
+// clear(), and extreme address boundaries (0 and UINTPTR_MAX).
+void test_swap_and_pop_rekey_clear_and_extremes() {
+    HostPageIndex idx;
+    uint8_t crowded[32] = {};
+    std::vector<std::pair<const void*, Range>> model;
+
+    // 32 entries packed inside a single 64 KiB granule (each 1 KiB apart).
+    for (size_t i = 0; i < 32; ++i) {
+        const uintptr_t lo = kBase + static_cast<uintptr_t>(i) * 2048 + 64;
+        const uintptr_t hi = lo + 512;
+        idx.add(&crowded[i], lo, hi);
+        model.emplace_back(&crowded[i], Range(lo, hi));
+    }
+    CHECK(idx.size() == 32);
+
+    // Re-key several entries in-place within the same granule (grow, shrink, shift).
+    for (size_t i = 0; i < 32; i += 4) {
+        const uintptr_t lo = kBase + static_cast<uintptr_t>(i) * 2048 + 128;
+        const uintptr_t hi = lo + 1024;
+        idx.add(&crowded[i], lo, hi);
+        model[i].second = Range(lo, hi);
+        uintptr_t got_lo = 0, got_hi = 0;
+        CHECK(idx.range_of(&crowded[i], &got_lo, &got_hi) && got_lo == lo && got_hi == hi);
+    }
+
+    // Remove front, middle, back, and every even index; verify remaining entries after each step.
+    const size_t remove_order[] = {0, 31, 15, 16, 2, 4, 6, 8, 10, 12, 14, 18, 20, 22, 24, 26, 28, 30};
+    for (size_t rem : remove_order) {
+        const void* k = &crowded[rem];
+        idx.remove(k);
+        model.erase(std::remove_if(model.begin(), model.end(), [&](const auto& e) { return e.first == k; }), model.end());
+        CHECK(!idx.contains(k) && idx.size() == model.size());
+        std::vector<const void*> got;
+        idx.collect_range(kBase, kBase + k64K, &got);
+        std::sort(got.begin(), got.end());
+        CHECK(got == ref_range(model, kBase, kBase + k64K));
+    }
+
+    // Drain remaining entries to empty, then re-add to exercise pool reset and slot reuse.
+    while (!model.empty()) {
+        const void* k = model.back().first;
+        idx.remove(k);
+        model.pop_back();
+    }
+    CHECK(idx.size() == 0 && idx.hulls().empty());
+
+    // Extreme addresses: lo == 0 and hi == UINTPTR_MAX (must not overflow align_up, kHullGap, or page_end).
+    // K(1) ends at aligned 0x...C000 and K(2) starts at aligned 0x...F000 (gap 3 pages <= kHullGap,
+    // while prev_hi + kHullGap == 0x...C000 + 0x4000 would wrap to 0 if computed naively).
+    constexpr uintptr_t kMaxAddr = std::numeric_limits<uintptr_t>::max();
+    const uintptr_t top_page = kMaxAddr - kPage + 1;
+    idx.add(K(0), 0, 1);
+    idx.add(K(1), kMaxAddr - 20000, kMaxAddr - 17000);
+    idx.add(K(2), kMaxAddr - 100, kMaxAddr);
+    CHECK(idx.size() == 3);
+
+    const auto& h = idx.hulls();
+    CHECK(h.size() == 2);
+    CHECK(h[0] == Range(0, kPage));
+    CHECK(ranges_cover(h, 0, 1));
+    CHECK(ranges_cover(h, kMaxAddr - 20000, kMaxAddr - 17000));
+    CHECK(ranges_cover(h, kMaxAddr - 100, kMaxAddr));
+    CHECK(h[0].second < h[1].first);
+
+    CHECK(pages_hit(idx, {0}) == sorted({K(0)}));
+    CHECK(pages_hit(idx, {top_page}) == sorted({K(2)}));
+    {
+        std::vector<const void*> got;
+        idx.collect_range(kMaxAddr - 200, kMaxAddr, &got);
+        CHECK(sorted(got) == sorted({K(2)}));
+    }
+
+    idx.clear();
+    CHECK(idx.size() == 0 && idx.hulls().empty());
+    idx.add(K(0), kBase + 0x100, kBase + 0x200);
+    CHECK(idx.size() == 1 && pages_hit(idx, {kBase}) == sorted({K(0)}));
+}
+
+// 5,000-entry stress parity test against a brute-force overlap oracle across adds, removals,
+// re-keys, free-list reuse, narrow/wide collect_range, and multi-granule collect_pages.
+void test_stress_5000_entries_parity() {
+    constexpr size_t kNumKeys = 5000;
+    std::vector<uint8_t> key_buf(kNumKeys, 0);
+    HostPageIndex idx;
+    std::vector<Range> model_ranges(kNumKeys, Range(0, 0));  // empty range means absent
+    Lcg rng;
+    rng.s = 0xD1B54A32D192ED03ull;
+
+    auto make_range = [&]() -> Range {
+        const uintptr_t gran = rng.below(512);
+        const uintptr_t off = rng.below(k64K);
+        const uintptr_t lo = kBase + gran * k64K + off;
+        uintptr_t len = 0;
+        const uint64_t kind = rng.below(10);
+        if (kind < 5) {
+            len = 1 + rng.below(kPage);  // small sub-page
+        } else if (kind < 8) {
+            len = kPage + rng.below(k64K);  // multi-page / granule-straddling
+        } else {
+            len = k64K + rng.below(6 * k64K);  // multi-granule
+        }
+        return Range(lo, lo + len);
+    };
+
+    // 1. Insert 5,000 entries.
+    for (size_t i = 0; i < kNumKeys; ++i) {
+        const Range r = make_range();
+        idx.add(&key_buf[i], r.first, r.second);
+        model_ranges[i] = r;
+    }
+    CHECK(idx.size() == kNumKeys);
+
+    // 2. Remove 1,250 entries.
+    for (size_t i = 0; i < kNumKeys; i += 4) {
+        idx.remove(&key_buf[i]);
+        model_ranges[i] = Range(0, 0);
+    }
+    CHECK(idx.size() == kNumKeys - kNumKeys / 4);
+
+    // 3. Re-key 1,000 live entries (half within same granule, half to random granules).
+    for (size_t i = 1; i < 4000; i += 4) {
+        Range r;
+        if ((i / 4) % 2 == 0) {
+            const uintptr_t g_base = model_ranges[i].first & ~(k64K - 1);
+            const uintptr_t lo = g_base + rng.below(k64K - 256);
+            r = Range(lo, lo + 1 + rng.below(256));
+        } else {
+            r = make_range();
+        }
+        idx.add(&key_buf[i], r.first, r.second);
+        model_ranges[i] = r;
+    }
+
+    // 4. Re-add 750 removed entries (exercises free-list slot reuse).
+    for (size_t i = 0; i < 3000; i += 4) {
+        const Range r = make_range();
+        idx.add(&key_buf[i], r.first, r.second);
+        model_ranges[i] = r;
+    }
+
+    // Build flat model vector and verify size() / contains() / range_of().
+    std::vector<std::pair<const void*, Range>> model;
+    model.reserve(kNumKeys);
+    for (size_t i = 0; i < kNumKeys; ++i) {
+        uintptr_t lo = 0, hi = 0;
+        if (model_ranges[i].first < model_ranges[i].second) {
+            model.emplace_back(&key_buf[i], model_ranges[i]);
+            CHECK(idx.contains(&key_buf[i]));
+            CHECK(idx.range_of(&key_buf[i], &lo, &hi) && lo == model_ranges[i].first && hi == model_ranges[i].second);
+        } else {
+            CHECK(!idx.contains(&key_buf[i]));
+            CHECK(!idx.range_of(&key_buf[i], &lo, &hi));
+        }
+    }
+    CHECK(idx.size() == model.size());
+
+    // 5. Verify hulls invariants (sorted, strictly disjoint, covers every live entry).
+    const auto& h = idx.hulls();
+    for (size_t i = 1; i < h.size(); ++i) {
+        CHECK(h[i - 1].second < h[i].first);
+    }
+    for (const auto& [k, r] : model) {
+        (void)k;
+        CHECK(ranges_cover(h, r.first, r.second));
+    }
+
+    // 6. Verify collect_pages parity across 4 KiB, 64 KiB, 2 MiB, and 8 MiB pages.
+    for (const uintptr_t pg : {kPage, k64K, uintptr_t{2} << 20, uintptr_t{8} << 20}) {
+        for (int q = 0; q < 4; ++q) {
+            std::vector<uintptr_t> pages;
+            const size_t n = 1 + static_cast<size_t>(rng.below(12));
+            for (size_t p = 0; p < n; ++p) {
+                const uintptr_t addr = ((kBase + rng.below(520 * k64K)) / pg) * pg;
+                pages.push_back(addr);
+            }
+            std::sort(pages.begin(), pages.end());
+            pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+            std::vector<const void*> got;
+            idx.collect_pages(pages, pg, &got);
+            std::sort(got.begin(), got.end());
+            CHECK(std::adjacent_find(got.begin(), got.end()) == got.end());
+            CHECK(got == ref_pages(model, pages, pg));
+        }
+    }
+
+    // 7. Verify collect_range parity across single-granule, narrow, boundary, and wide spans.
+    const std::vector<uintptr_t> spans = {kPage, 8 * k64K, 64 * k64K, 65 * k64K, 300 * k64K, 600 * k64K};
+    for (const uintptr_t span : spans) {
+        const uintptr_t lo = kBase + rng.below(200 * k64K);
+        const uintptr_t hi = lo + span;
+        std::vector<const void*> got;
+        idx.collect_range(lo, hi, &got);
+        std::sort(got.begin(), got.end());
+        CHECK(std::adjacent_find(got.begin(), got.end()) == got.end());
+        CHECK(got == ref_range(model, lo, hi));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -343,6 +666,10 @@ int main() {
     test_map_unmap_remap_and_resize();
     test_many_pages_one_query();
     test_cover_and_merge();
+    test_repeated_queries_and_dedup_reset();
+    test_large_vs_narrow_range_and_multi_granule_pages();
+    test_swap_and_pop_rekey_clear_and_extremes();
+    test_stress_5000_entries_parity();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;
