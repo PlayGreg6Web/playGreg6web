@@ -296,6 +296,7 @@ struct Options {
     bool no_async_pipelines = false;    // --no-async-pipelines: live executor creates pipelines synchronously
     std::string shader_pack;        // --shader-pack: WGPK whose keys resolve pipeline stages
     bool gpu_validation = false;    // --gpu-validation: strict Dawn validation in the live executor
+    int64_t submit_budget_ms = -1;  // --submit-budget-ms N: per-submit GPU time budget (ExecutorOptions::submit_budget_ns; 0 off, -1 default)
     bool split_passes = false;      // --split-passes / --no-split-passes: one command buffer per pass (ExecutorOptions::split_passes, off by default)
     bool usage_snapshots = false;   // --usage-snapshots / --no-usage-snapshots: usage-scope snapshots (ExecutorOptions::usage_snapshots, off by default)
     bool gpu_error_scopes = false;  // --gpu-error-scopes: attribute device errors (phase, present, shader hashes) in the report
@@ -364,7 +365,7 @@ void usage() {
                  "                     [--dump-pipelines <dir outside the repo, or under work/>]\n"
                  "                     [--pipeline-warm-list <file|off>]\n"
                  "                     [--dawn-cache <dir|off>] [--dawn-cache-max-mb N] [--no-async-pipelines]\n"
-                 "                     [--pipeline-wait-ms N|inf] [--pipeline-wait-fullscreen-ms N|inf]\n"
+                 "                     [--pipeline-wait-ms N|inf] [--pipeline-wait-fullscreen-ms N|inf] [--submit-budget-ms N]\n"
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>] [--host-input]\n"
                  "                     [--record-input <file>] [--keymap <file>]\n"
                  "                     [--wgpu-features <mask>] [--audio-dump <file.wav>] [--audio-out]\n"
@@ -483,6 +484,11 @@ bool parse(int argc, char** argv, Options& o) {
             o.gpu_validation = true;
         } else if (a == "--gpu-error-scopes") {
             o.gpu_error_scopes = true;
+        } else if (a == "--submit-budget-ms" && i + 1 < argc) {
+            char* end = nullptr;
+            const long long v = std::strtoll(argv[++i], &end, 10);
+            if (!end || *end || v < 0) return false;
+            o.submit_budget_ms = v;
         } else if (a == "--split-passes") {
             o.split_passes = true;
         } else if (a == "--no-split-passes") {
@@ -1358,6 +1364,7 @@ bool start_live_window() {
     options.gpu_validation = g_options.gpu_validation;
     options.gpu_error_scopes = g_options.gpu_error_scopes;
     options.split_passes = g_options.split_passes;
+    if (g_options.submit_budget_ms >= 0) options.submit_budget_ns = static_cast<uint64_t>(g_options.submit_budget_ms) * 1000000ull;
     options.usage_snapshots = g_options.usage_snapshots;
     options.frame_digest_path = g_options.live_digest;
     options.gpu_time_split = g_options.gpu_time_split;

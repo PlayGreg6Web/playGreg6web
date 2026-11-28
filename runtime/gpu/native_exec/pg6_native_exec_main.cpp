@@ -101,6 +101,8 @@ int main(int argc, char** argv) {
             opts.gpu_validation = true;
         } else if (a == "--gpu-error-scopes") {
             opts.gpu_error_scopes = true;
+        } else if (a == "--submit-budget-ms" && (v = next())) {
+            opts.submit_budget_ns = std::strtoull(v, nullptr, 10) * 1000000ull;
         } else if (a == "--split-passes") {
             opts.split_passes = true;
         } else if (a == "--no-split-passes") {

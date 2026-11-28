@@ -2523,6 +2523,62 @@ void test_timers() {
     timed_frame();
     ex->wait_idle();
     CHECK(ex->stats().timer_frames > frames_before);
+
+    // submit_budget_ns (250 ms by default): passes whose timing key averages 400 ms each end the submit at
+    // the pass boundary after them, so one frame goes to the GPU in several submits (no ~3 s submit: a TDR).
+    for (int i = 0; i < 1000; ++i) table.record(kHash, gpu::d3d12_guest::GpuPassKind::Compute, 400000000ull);
+    {
+        gpu::CommandEncoder tex;
+        emit(tex, GpuOpcode::CreateTexture2,
+             bytes_of(texture2(206, 4, 4, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst | GpuTextureUsage::CopySrc, 22)));
+        emit(tex, GpuOpcode::CreateTexture2, bytes_of(texture2(207, 4, 4, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 22)));
+        run(*ex, tex);
+        GpuCopyTexturePayload c;
+        std::memset(&c, 0, sizeof c);
+        c.dst_id = 207;
+        c.src_id = 206;
+        c.width = 2;
+        c.height = 2;
+        c.depth_or_layers = 1;
+        const ExecutorStats b4 = ex->stats();
+        gpu::CommandEncoder frame;
+        frame.begin_frame();
+        frame.set_compute_pipeline(204);
+        set_bind_group2(frame, 0, 205);
+        frame.dispatch_compute(64);
+        emit(frame, kGpuOpcodeCopyTexture, bytes_of(c));  // ends the first compute pass
+        frame.dispatch_compute(64);
+        frame.present();
+        CHECK(run(*ex, frame) == 1);
+        ex->wait_idle();
+        CHECK(ex->stats().dispatches == b4.dispatches + 2);
+        CHECK(ex->stats().device_errors == b4.device_errors);
+        CHECK(ex->stats().submit_budget_splits >= b4.submit_budget_splits + 1);
+        CHECK(ex->stats().submits_tracked >= b4.submits_tracked + 2);
+        CHECK(ex->stats().submit_est_max_ns >= 390000000ull);
+        CHECK(ex->stats_json().find("\"submit_budget_splits\": ") != std::string::npos);
+        CHECK(ex->stats_json().find("\"submit_budget_ms\": 250") != std::string::npos);
+
+        // A loss with that frame in flight: the record names its passes, estimated time and heaviest pass
+        // (a lost device's work-done callbacks no longer empty it).
+        gpu::CommandEncoder again;
+        again.begin_frame();
+        again.set_compute_pipeline(204);
+        set_bind_group2(again, 0, 205);
+        again.dispatch_compute(64);
+        again.present();
+        run(*ex, again);
+        ex->debug_force_device_lost("simulated hang: Device removed reason: DXGI_ERROR_DEVICE_HUNG (0x887A0006)");
+        timed_frame();
+        ex->wait_idle();
+        CHECK(!ex->faulted());
+        CHECK(ex->stats().device_removed_reason == "DXGI_ERROR_DEVICE_HUNG");
+        const std::string& inflight = ex->stats().device_lost_inflight;
+        if (!inflight.empty() && inflight != "[]") {
+            CHECK(inflight.find("\"est_gpu_ms\": ") != std::string::npos);
+            CHECK(inflight.find("\"top_pass\": {\"hash\": \"0x00c0ffee0badf00d\"") != std::string::npos);
+        }
+    }
     ex.reset();  // closes the pack
     std::remove(path.c_str());
 }
@@ -3878,6 +3934,26 @@ void test_show_target_bad_option() {
 // Device loss (simulated with Device::ForceLoss): the executor rebuilds adapter / device and the journaled
 // resources (buffer + texture contents come back byte for byte), drops only the frame under construction,
 // keeps presenting, and counts it; where it cannot rebuild it ends the run with a fault record.
+// The direct-dispatch cut (kMaxDispatchGroups workgroups in all) and the removed reason out of Dawn's message.
+void test_dispatch_clamp_and_removed_reason() {
+    using gpu::native_exec::clamp_dispatch_groups;
+    using gpu::native_exec::kMaxDispatchGroups;
+    uint32_t x = 64, y = 64, z = 64;
+    CHECK(!clamp_dispatch_groups(&x, &y, &z) && x == 64 && y == 64 && z == 64);
+    x = 1024, y = 1024, z = 1024;
+    CHECK(clamp_dispatch_groups(&x, &y, &z) && x == 1024 && y == 1024 && z == 4);
+    x = 65535, y = 65535, z = 65535;
+    CHECK(clamp_dispatch_groups(&x, &y, &z) && z == 1 && uint64_t{x} * y * z <= kMaxDispatchGroups && y >= 1);
+    x = 0xffffffffu, y = 1, z = 1;
+    CHECK(clamp_dispatch_groups(&x, &y, &z) && uint64_t{x} * y * z == kMaxDispatchGroups);
+    CHECK(gpu::native_exec::device_removed_reason_of(
+              "unknown: ID3D12Device::GetDeviceRemovedReason failed with DXGI_ERROR_DEVICE_HUNG (0x887A0006)\n"
+              " * Device removed reason: DXGI_ERROR_DEVICE_HUNG (0x887A0006)") == "DXGI_ERROR_DEVICE_HUNG");
+    CHECK(gpu::native_exec::device_removed_reason_of("create command queue failed with DXGI_ERROR_DEVICE_REMOVED (0x887A0005)") ==
+          "DXGI_ERROR_DEVICE_REMOVED");
+    CHECK(gpu::native_exec::device_removed_reason_of("simulated driver reset").empty());
+}
+
 void test_device_loss() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -3995,7 +4071,7 @@ void test_device_loss() {
     CHECK(ex5 != nullptr);
     if (!ex5) return;
     CHECK(run(*ex5, red) == 1);
-    ex5->debug_fail_device_creations(5);
+    ex5->debug_fail_device_creations(6);  // every attempt of the recovery
     ex5->debug_force_device_lost("simulated out of memory");
     CHECK(run(*ex5, red) == 0);
     CHECK(ex5->faulted() && !ex5->poll());
@@ -5428,6 +5504,7 @@ int main() {
     test_bind_group_budget();
     test_dump_targets();
     test_present_plane_composition();
+    test_dispatch_clamp_and_removed_reason();
     test_device_loss();
     test_device_loss_journal();
     test_async_pipelines_and_blob_cache();

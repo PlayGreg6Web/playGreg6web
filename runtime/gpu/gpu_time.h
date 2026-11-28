@@ -42,6 +42,8 @@ public:
     Support support() const;
     // Adds one measured pass. Implies Available.
     void record(uint64_t hash, GpuPassKind kind, uint64_t ns);
+    // The key's measured passes so far (false: never measured).
+    bool lookup(uint64_t hash, GpuPassKind kind, Stats* out) const;
     void note_skipped_frame();
     void note_skipped_passes(uint64_t n);
     void note_measured_frame(uint64_t gpu_ns);

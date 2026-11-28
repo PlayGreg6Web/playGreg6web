@@ -1007,7 +1007,10 @@ struct NativeExecutor::Impl {
 
     // ---- setup ----
 
-    bool init(CreateStatus* status, std::string* error) {
+    // The WebGPU instance (Dawn's physical devices). A device-loss recovery that finds the adapter removed
+    // makes a new one: Dawn's D3D12 physical device keeps the removed ID3D12Device, and D3D12 hands that same
+    // (removed) device to every later D3D12CreateDevice on the adapter until all its references are gone.
+    bool create_instance(CreateStatus* status, std::string* error) {
         static const wgpu::InstanceFeatureName kFeatures[] = {wgpu::InstanceFeatureName::TimedWaitAny};
         wgpu::InstanceDescriptor idesc{};
         idesc.requiredFeatureCount = 1;
@@ -1038,6 +1041,29 @@ struct NativeExecutor::Impl {
             *error = "wgpuCreateInstance failed";
             return false;
         }
+        return true;
+    }
+
+    // The window's surface on the current instance (no window: nothing to make).
+    bool create_surface(std::string* error) {
+        if (!window) return true;
+#ifdef _WIN32
+        wgpu::SurfaceSourceWindowsHWND src{};
+        src.hinstance = window->native_instance();
+        src.hwnd = window->native_handle();
+        wgpu::SurfaceDescriptor sdesc{};
+        sdesc.nextInChain = &src;
+        surface = instance.CreateSurface(&sdesc);
+#endif
+        if (!surface) {
+            *error = "CreateSurface failed";
+            return false;
+        }
+        return true;
+    }
+
+    bool init(CreateStatus* status, std::string* error) {
+        if (!create_instance(status, error)) return false;
         swap_width = options.width ? options.width : 1;
         swap_height = options.height ? options.height : 1;
         stream_w = swap_width;
@@ -1061,17 +1087,8 @@ struct NativeExecutor::Impl {
                 *status = CreateStatus::Failed;
                 return false;
             }
-#ifdef _WIN32
-            wgpu::SurfaceSourceWindowsHWND src{};
-            src.hinstance = window->native_instance();
-            src.hwnd = window->native_handle();
-            wgpu::SurfaceDescriptor sdesc{};
-            sdesc.nextInChain = &src;
-            surface = instance.CreateSurface(&sdesc);
-#endif
-            if (!surface) {
+            if (!create_surface(error)) {
                 *status = CreateStatus::Failed;
-                *error = "CreateSurface failed";
                 return false;
             }
         }
@@ -1305,6 +1322,12 @@ struct NativeExecutor::Impl {
                 wgpu::CallbackMode::AllowSpontaneous,
                 [](const wgpu::Device&, wgpu::DeviceLostReason reason, wgpu::StringView msg, Impl* self) {
                     if (reason == wgpu::DeviceLostReason::Destroyed) return;  // our own teardown
+                    if (reason == wgpu::DeviceLostReason::FailedCreation) {
+                        // A RequestDevice that failed (RequestDevice reports it too): no device was lost, and the
+                        // reason of the loss being recovered from (e.g. DXGI_ERROR_DEVICE_HUNG) stays reported.
+                        self->stats.last_device_error = to_string(msg);
+                        return;
+                    }
                     ++self->stats.device_lost;
                     ++self->stats.device_lost_events;
                     self->stats.last_device_error = to_string(msg);
@@ -2910,7 +2933,9 @@ struct NativeExecutor::Impl {
         stats.fault_record = "{\"kind\": \"gpu_device_lost\", \"reason\": \"" + json_escape(why) + "\", \"device_error\": \"" +
                              json_escape(stats.last_device_error) + "\", \"lost_reason\": \"" +
                              json_escape(stats.device_lost_reason) + "\", \"lost_message\": \"" +
-                             json_escape(stats.device_lost_message) + "\", \"inflight\": " +
+                             json_escape(stats.device_lost_message) + "\", \"removed_reason\": \"" +
+                             json_escape(stats.device_removed_reason) + "\", \"recovery_attempts\": " +
+                             std::to_string(stats.recovery_attempts) + ", \"inflight\": " +
                              (stats.device_lost_inflight.empty() ? std::string("[]") : stats.device_lost_inflight) +
                              ", \"journal_bytes\": " + std::to_string(stats.journal_bytes) +
                              ", \"journal_budget\": " + std::to_string(journal_budget) + ", \"device_lost_events\": " +
@@ -2935,6 +2960,21 @@ struct NativeExecutor::Impl {
         if (fatal) return false;
         if (!lost) return true;
         return recover();
+    }
+
+    // Drops the surface and the instance (after release_device_objects) and makes both again.
+    bool reset_instance(std::string* error) {
+        if (options.force_fallback_adapter) return true;  // the CPU adapter is never removed
+        surface = nullptr;
+        surface_configured = false;
+        if (instance) instance.ProcessEvents();
+        instance = nullptr;
+        native_instance.reset();
+        CreateStatus st = CreateStatus::Failed;
+        if (!create_instance(&st, error)) return false;
+        if (!create_surface(error)) return false;
+        ++stats.recovery_instance_resets;
+        return true;
     }
 
     bool recover() {
@@ -2971,15 +3011,29 @@ struct NativeExecutor::Impl {
                          static_cast<unsigned long long>(m.buffer_bytes >> 20), static_cast<unsigned long long>(m.bind_groups),
                          static_cast<unsigned long long>(m.dead_textures_pinned), static_cast<unsigned long long>(m.dead_texture_bytes_pinned >> 20));
         }
-        for (int attempt = 0; attempt < 5 && !ok; ++attempt) {
+        stats.device_removed_reason = device_removed_reason_of(stats.device_lost_message);
+        // A hung / removed adapter: the old instance's physical device holds the removed ID3D12Device, so
+        // every attempt after the first makes a new instance (and surface) once everything is released.
+        // Backoff 0, 250, 500, 1000, 2000, 4000 ms: the driver resets the adapter after a TDR (seconds).
+        static constexpr int kAttempts = 6;
+        for (int attempt = 0; attempt < kAttempts && !ok; ++attempt) {
             release_device_objects();
             if (attempt == 0) sample_memory("released");  // what the old device left behind
-            if (attempt) std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            if (attempt) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(250ll << (attempt - 1)));
+                std::string ierr;
+                if (!reset_instance(&ierr)) {
+                    last_error = ierr;
+                    continue;
+                }
+            }
+            ++stats.recovery_attempts;
             lost = false;
             CreateStatus st = CreateStatus::Failed;
             std::string err;
             if (!acquire_device(&st, &err)) {
                 last_error = err;
+                std::fprintf(stderr, "[native_exec] recovery attempt %d failed: %s\n", attempt + 1, err.c_str());
                 continue;
             }
             if (!features_equal(before, features)) return fail_fatal("the new device lacks features the old one had");
@@ -3018,6 +3072,23 @@ struct NativeExecutor::Impl {
         return true;
     }
 
+    // A pass is about to be encoded: its estimated GPU time (the measured average of its timing key) is added
+    // to the submit being built (submit_budget_ns, and the in-flight record of a lost device).
+    void note_pass_estimate(uint64_t hash, d3d12_guest::GpuPassKind kind) {
+        ++sub_passes;
+        if (!time_table) return;
+        d3d12_guest::GpuTimeTable::Stats st;
+        if (!time_table->lookup(hash, kind, &st)) return;
+        const uint64_t avg = st.total_ns / st.passes;
+        sub_est_ns += avg;
+        if (avg > sub_top_ns) {
+            sub_top_ns = avg;
+            sub_top_max_ns = st.max_ns;
+            sub_top_hash = hash;
+            sub_top_compute = kind == d3d12_guest::GpuPassKind::Compute;
+        }
+    }
+
     // ---- in-flight submits (device loss diagnostics) ----
     //
     // Every frame / read-back submit is summarized (work counts since the previous one) and watched with
@@ -3025,11 +3096,17 @@ struct NativeExecutor::Impl {
     struct InflightSubmit {
         uint64_t seq = 0, t_ns = 0, frame = 0, command_buffers = 0;
         uint64_t draws = 0, dispatches = 0, indirect = 0, snapshot_bytes = 0, max_draw_work = 0, max_groups = 0;
+        // Passes, their estimated GPU time and the heaviest one (timing key, average / max measured ns).
+        uint64_t passes = 0, est_ns = 0, top_hash = 0, top_ns = 0, top_max_ns = 0, max_groups_hash = 0;
+        bool top_compute = false;
     };
     std::deque<InflightSubmit> inflight;
     uint64_t submit_seq = 0, submits_done = 0, submit_epoch = 0;
     uint64_t sub_draws0 = 0, sub_dispatches0 = 0, sub_snap0 = 0;
     uint64_t sub_indirect = 0, sub_max_draw_work = 0, sub_max_groups = 0;
+    uint64_t sub_max_groups_hash = 0;
+    uint64_t sub_passes = 0, sub_est_ns = 0, sub_top_hash = 0, sub_top_ns = 0, sub_top_max_ns = 0;
+    bool sub_top_compute = false;
 
     // A direct draw's vertex (index) x instance count above kMaxDrawWork: the instances are cut so the draw
     // stays within it (a garbage count would keep the GPU busy for seconds: a TDR).
@@ -3054,10 +3131,21 @@ struct NativeExecutor::Impl {
         f.indirect = sub_indirect;
         f.max_draw_work = sub_max_draw_work;
         f.max_groups = sub_max_groups;
+        f.max_groups_hash = sub_max_groups_hash;
+        sub_max_groups_hash = 0;
         sub_draws0 = stats.draws;
         sub_dispatches0 = stats.dispatches;
         sub_snap0 = stats.usage_snapshot_bytes;
+        f.passes = sub_passes;
+        f.est_ns = sub_est_ns;
+        f.top_hash = sub_top_hash;
+        f.top_ns = sub_top_ns;
+        f.top_max_ns = sub_top_max_ns;
+        f.top_compute = sub_top_compute;
+        stats.submit_est_max_ns = std::max(stats.submit_est_max_ns, sub_est_ns);
         sub_indirect = sub_max_draw_work = sub_max_groups = 0;
+        sub_passes = sub_est_ns = sub_top_hash = sub_top_ns = sub_top_max_ns = 0;
+        sub_top_compute = false;
         if (inflight.size() >= 64) inflight.pop_front();
         inflight.push_back(f);
         ++stats.submits_tracked;
@@ -3075,6 +3163,9 @@ struct NativeExecutor::Impl {
     }
 
     void submit_done() {
+        // A lost device completes its pending work-done callbacks: those submits did not finish, they stay
+        // in flight for note_lost_inflight (the loss record) and their age is not a GPU time.
+        if (lost) return;
         const uint64_t seq = submits_done++;
         const uint64_t t = now_ns();
         while (!inflight.empty() && inflight.front().seq <= seq) {
@@ -3102,7 +3193,12 @@ struct NativeExecutor::Impl {
                  ", \"dispatches\": " + std::to_string(f.dispatches) + ", \"indirect\": " + std::to_string(f.indirect) +
                  ", \"snapshot_bytes\": " + std::to_string(f.snapshot_bytes) +
                  ", \"max_draw_work\": " + std::to_string(f.max_draw_work) +
-                 ", \"max_groups\": " + std::to_string(f.max_groups) + "}";
+                 ", \"max_groups\": " + std::to_string(f.max_groups) + ", \"max_groups_pipeline\": \"" +
+                 hash_hex(f.max_groups_hash) + "\", \"passes\": " + std::to_string(f.passes) +
+                 ", \"est_gpu_ms\": " + std::to_string(f.est_ns / 1000000ull) + ", \"top_pass\": {\"hash\": \"" +
+                 hash_hex(f.top_hash) + "\", \"kind\": \"" + (f.top_compute ? "compute" : "render") +
+                 "\", \"avg_ms\": " + std::to_string(f.top_ns / 1000000ull) + ", \"max_ms\": " +
+                 std::to_string(f.top_max_ns / 1000000ull) + "}}";
         }
         o += "]";
         stats.device_lost_inflight = o;
@@ -7467,10 +7563,19 @@ struct NativeExecutor::Impl {
 
         // split_passes: a pass just ended; its commands become a command buffer of their own, so a
         // validation error in it cannot invalidate the passes before or after it.
+        // submit_budget_ns: the passes encoded so far are estimated to keep the GPU busy for the budget: they
+        // are submitted now (at this pass boundary) so the rest of the frame goes into a later submit.
         void cut() {
-            if (!s.options.split_passes) return;
+            const bool over = s.options.submit_budget_ns && s.sub_est_ns >= s.options.submit_budget_ns;
+            if (!s.options.split_passes && !over) return;
             done.push_back(enc.Finish());
             enc = s.device.CreateCommandEncoder();
+            if (!over) return;
+            for (wgpu::CommandBuffer& cb : done) s.queue.Submit(1, &cb);
+            s.stats.command_buffers += done.size();
+            ++s.stats.submit_budget_splits;
+            s.track_submit(done.size());
+            done.clear();
         }
         // Finishes the last command buffer and submits every one in encode order (one Submit each: Dawn
         // rejects a whole Submit when any buffer in it is invalid).
@@ -7994,6 +8099,7 @@ struct NativeExecutor::Impl {
                 y = std::min(y, max_workgroups_per_dim);
                 z = std::min(z, max_workgroups_per_dim);
             }
+            if (clamp_dispatch_groups(&x, &y, &z)) ++stats.dispatches_clamped;
             remap_before_dispatch(e);
             if (invalid_binds_block(e, true)) return;
             e.ensure_compute();
@@ -8009,7 +8115,11 @@ struct NativeExecutor::Impl {
             ++stats.dispatches;
             if (!options.dump_targets_at.empty()) dump_note_dispatch(e);
             if (!options.dump_targets_at.empty()) dump_note_work(e, true);
-            sub_max_groups = std::max<uint64_t>(sub_max_groups, uint64_t{x} * y * z);
+            if (uint64_t{x} * y * z > sub_max_groups) {
+                sub_max_groups = uint64_t{x} * y * z;
+                auto hit = e.active_compute ? compute_hash.find(*e.active_compute) : compute_hash.end();
+                sub_max_groups_hash = hit != compute_hash.end() ? hit->second : 0;
+            }
             alias_post_dispatch(e);
         } else if (const auto* vp = std::get_if<ViewportCmd>(&cmd)) {
             if (!e.rpass) return;
@@ -9671,6 +9781,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
 
     // Reserves the query pair of one pass in this submit's ring slot; false = the pass goes untimed.
     bool timer_pass(Encoder& e, d3d12_guest::GpuPassKind kind, uint64_t hash, wgpu::PassTimestampWrites* out) {
+        note_pass_estimate(hash, kind);
         if (!time_ring) return false;
         if (e.timer_slot == -2) {
             e.timer_slot = time_ring->begin_frame();
@@ -10723,6 +10834,11 @@ std::string NativeExecutor::stats_json() const {
     num("recovery_contents_lost", st.recovery_contents_lost);
     num("submits_tracked", st.submits_tracked);
     num("submit_gpu_max_ms", st.submit_gpu_max_ns / 1000000ull);
+    num("submit_est_max_ms", st.submit_est_max_ns / 1000000ull);
+    num("submit_budget_ms", impl_->options.submit_budget_ns / 1000000ull);
+    num("submit_budget_splits", st.submit_budget_splits);
+    num("recovery_attempts", st.recovery_attempts);
+    num("recovery_instance_resets", st.recovery_instance_resets);
     num("submit_gpu_max_frame", st.submit_gpu_max_frame);
     num("draws_clamped", st.draws_clamped);
     num("textures_destroyed", st.textures_destroyed);
@@ -10740,6 +10856,7 @@ std::string NativeExecutor::stats_json() const {
     j += "\"memory_timeline\": " + impl_->memory_timeline_json() + ", ";
     if (!st.device_lost_reason.empty()) {
         j += "\"device_lost_reason\": \"" + Impl::json_escape(st.device_lost_reason) + "\", ";
+        j += "\"device_removed_reason\": \"" + Impl::json_escape(st.device_removed_reason) + "\", ";
         j += "\"device_lost_message\": \"" + Impl::json_escape(st.device_lost_message) + "\", ";
         j += "\"device_lost_inflight\": " + (st.device_lost_inflight.empty() ? std::string("[]") : st.device_lost_inflight) + ", ";
     }

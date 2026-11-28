@@ -69,6 +69,14 @@ void GpuTimeTable::record(uint64_t hash, GpuPassKind kind, uint64_t ns) {
     s->max_ns = std::max(s->max_ns, ns);
 }
 
+bool GpuTimeTable::lookup(uint64_t hash, GpuPassKind kind, Stats* out) const {
+    std::lock_guard<std::mutex> lock(mu_);
+    auto it = map_.find(key_of(hash, kind));
+    if (it == map_.end() || it->second.passes == 0) return false;
+    *out = it->second;
+    return true;
+}
+
 void GpuTimeTable::note_skipped_frame() {
     std::lock_guard<std::mutex> lock(mu_);
     ++frames_skipped_;

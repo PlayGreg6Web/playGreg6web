@@ -9,6 +9,7 @@
 // execute() and every other call must come from that thread.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -106,6 +107,11 @@ struct ExecutorOptions {
     // fires (std-pack --live-executor boot of 3d57fb4a: 0 fps from ~90 s, sub_1423CF620 at 120 s; with
     // the split off the same build runs past 170 s).
     bool split_passes = false;
+    // Per-submit GPU time budget (--submit-budget-ms, 0 = off): a frame's passes are submitted early, at a
+    // pass boundary, once the GPU time they are estimated to take (the measured average of each pass's
+    // timing key, gpu_time) reaches it, so no single submit runs for the ~2 s Windows' TDR allows (one
+    // in-world frame of the std-pack --live-executor boot took ~3 s on the GPU: DXGI_ERROR_DEVICE_HUNG).
+    uint64_t submit_budget_ns = 250ull * 1000000ull;
     // Usage-scope snapshots (opt-in, --usage-snapshots; usage_scope_model.h): a read-only binding of a
     // resource the same draw / dispatch writes is bound from a copy of its read range taken right before
     // it. Off by default: in the in-world scene of the std-pack --live-executor boot they copy ~950 GB in
@@ -164,6 +170,35 @@ struct ExecutorOptions {
 
 inline constexpr size_t kOpcodeSlots = 64;
 
+// A direct dispatch's workgroups in all are cut to kMaxDispatchGroups (z first, then y, then x), as the
+// ExecuteIndirect clamp pass cuts indirect ones (state_bridge indirect_clamp_wgsl MAX_GROUPS): a garbage
+// count would keep the GPU busy past the TDR limit. True: the counts were cut.
+inline constexpr uint64_t kMaxDispatchGroups = uint64_t{1} << 22;
+inline bool clamp_dispatch_groups(uint32_t* x, uint32_t* y, uint32_t* z) {
+    if (uint64_t{*x} * *y * *z <= kMaxDispatchGroups) return false;
+    if (*x > kMaxDispatchGroups) *x = static_cast<uint32_t>(kMaxDispatchGroups);
+    if (uint64_t{*x} * *y > kMaxDispatchGroups) {
+        *z = 1;
+        *y = static_cast<uint32_t>(std::max<uint64_t>(1, kMaxDispatchGroups / *x));
+    } else {
+        *z = static_cast<uint32_t>(std::max<uint64_t>(1, kMaxDispatchGroups / (uint64_t{*x} * *y)));
+    }
+    return true;
+}
+
+// "DXGI_ERROR_DEVICE_HUNG" out of Dawn's device-loss message ("Device removed reason: <code> (0x...)", from
+// ID3D12Device::GetDeviceRemovedReason); else its first DXGI_ERROR_ code; empty when it has none.
+inline std::string device_removed_reason_of(const std::string& msg) {
+    static const std::string kKey = "Device removed reason: ";
+    size_t p = msg.find(kKey);
+    if (p != std::string::npos) p += kKey.size();
+    else p = msg.find("DXGI_ERROR_");
+    if (p == std::string::npos) return {};
+    size_t e = p;
+    while (e < msg.size() && ((msg[e] >= 'A' && msg[e] <= 'Z') || (msg[e] >= '0' && msg[e] <= '9') || msg[e] == '_')) ++e;
+    return msg.substr(p, e - p);
+}
+
 struct ExecutorStats {
     uint64_t batches = 0;
     uint64_t packets = 0;
@@ -197,6 +232,11 @@ struct ExecutorStats {
     std::string device_lost_reason;
     std::string device_lost_message;
     std::string device_lost_inflight;
+    std::string device_removed_reason;        // GetDeviceRemovedReason of the last loss (e.g. DXGI_ERROR_DEVICE_HUNG)
+    uint64_t recovery_attempts = 0;           // device creations tried by recoveries
+    uint64_t recovery_instance_resets = 0;    // ... after dropping the instance (the removed adapter's D3D12 device)
+    uint64_t submit_budget_splits = 0;        // early submits at a pass boundary (submit_budget_ns)
+    uint64_t submit_est_max_ns = 0;           // the largest estimated GPU time of one submit
     uint64_t submits_tracked = 0;             // frame submits watched for completion
     uint64_t submit_gpu_max_ns = 0;           // the longest submit -> completion time seen
     uint64_t submit_gpu_max_frame = 0;        // ... and the frame (frames_submitted) it belonged to
