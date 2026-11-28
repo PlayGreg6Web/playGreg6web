@@ -2121,7 +2121,8 @@ class TestBrowserBootFlags(unittest.TestCase):
         "-sEXPORTED_RUNTIME_METHODS=wasmMemory,FS,HEAPU8,addRunDependency,removeRunDependency"
     )
     EXPECTED_EXPORTED_FUNCTIONS = (
-        "-sEXPORTED_FUNCTIONS=_main,_playgta6_get_input_state_ptr,_playgta6_audio_ring"
+        "-sEXPORTED_FUNCTIONS=_main,_playgta6_get_input_state_ptr,_playgta6_audio_ring,"
+        "_playgta6_storage_generation,_playgta6_storage_take_changed"
     )
 
     def _repo(self, tmp: Path) -> Path:
@@ -2444,17 +2445,27 @@ class TestBrowserBootFlags(unittest.TestCase):
         exported = bgw.BROWSER_BOOT_EXPORTED_FUNCTIONS.split(",")
         self.assertEqual(
             exported,
-            ["_main", "_playgta6_get_input_state_ptr", "_playgta6_audio_ring"],
+            [
+                "_main",
+                "_playgta6_get_input_state_ptr",
+                "_playgta6_audio_ring",
+                "_playgta6_storage_generation",
+                "_playgta6_storage_take_changed",
+            ],
         )
 
-        # Disabled by default: neither -sEXPORTED_FUNCTIONS nor _playgta6_audio_ring is emitted.
+        # Disabled by default: neither -sEXPORTED_FUNCTIONS nor browser-boot symbols are emitted.
         default_flags = bgw.resolve_link_flags()
         self.assertFalse(any("_playgta6_audio_ring" in f for f in default_flags))
+        self.assertFalse(any("_playgta6_storage_generation" in f for f in default_flags))
+        self.assertFalse(any("_playgta6_storage_take_changed" in f for f in default_flags))
         default_split_flags = bgw.resolve_link_flags(main_module=True)
         self.assertFalse(any("_playgta6_audio_ring" in f for f in default_split_flags))
+        self.assertFalse(any("_playgta6_storage_generation" in f for f in default_split_flags))
+        self.assertFalse(any("_playgta6_storage_take_changed" in f for f in default_split_flags))
 
-        # Enabled: both monolithic and split-module builds export _playgta6_audio_ring alongside
-        # _main and _playgta6_get_input_state_ptr.
+        # Enabled: both monolithic and split-module builds export _playgta6_audio_ring and
+        # storage persistence hooks alongside _main and _playgta6_get_input_state_ptr.
         for main_module in (False, True):
             flags = bgw.resolve_link_flags(browser_boot_exports=True, main_module=main_module)
             exported_flags = [f for f in flags if f.startswith("-sEXPORTED_FUNCTIONS=")]
@@ -2463,6 +2474,8 @@ class TestBrowserBootFlags(unittest.TestCase):
             self.assertIn("_main", symbols)
             self.assertIn("_playgta6_get_input_state_ptr", symbols)
             self.assertIn("_playgta6_audio_ring", symbols)
+            self.assertIn("_playgta6_storage_generation", symbols)
+            self.assertIn("_playgta6_storage_take_changed", symbols)
 
             link_argv = bgw.build_link_argv(
                 "em++",
