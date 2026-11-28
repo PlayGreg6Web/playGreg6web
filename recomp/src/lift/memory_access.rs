@@ -35,6 +35,9 @@ pub(super) enum StackDisp {
 /// Maximum number of dynamic window translations cached simultaneously within one basic block.
 const MAX_WINDOW_LOAD_CACHE: usize = 4;
 
+/// Maximum number of dominating table slot-delta loads cached within one basic block.
+const MAX_SLOT_DELTA_CACHE: usize = 8;
+
 /// Maximum span (in bytes) of a coalesced same-base window burst.
 pub(super) const BURST_MAX_SPAN: u64 = 4096;
 
@@ -44,16 +47,57 @@ pub(super) fn const_addr(addr: &str) -> Option<u64> {
     addr.parse::<i64>().ok().map(|v| v as u64)
 }
 
-/// Cached translation of a dynamic address from a prior `guest_load` in the same basic block
-/// (`WindowCheck::Branch` with `contiguous_runs`): lets an immediate read-modify-write store
-/// (e.g. `add [rcx], rax`) or repeated load reuse `delta`, `inside`, `rel`, and `ptr` without a
-/// second window range check or table lookup. Cleared on block boundaries and any call/atomic/fence.
+/// Cached table slot delta (`@__playgta6_window_table[index]` or `@__playgta6_page_table[index]`)
+/// loaded on the unconditional dominating path of the current basic block. Cleared at block
+/// boundaries and any call/atomic/fence/helper.
+#[derive(Clone)]
+pub(super) struct CachedSlotDelta {
+    pub(super) table: &'static str,
+    pub(super) index: String,
+    pub(super) delta: String,
+}
+
+/// Cached branch-free `WindowCheck::Select` translation for an address or provably aligned base
+/// within the current basic block. Cleared at block boundaries and any call/atomic/fence/helper.
+#[derive(Clone)]
+pub(super) struct CachedSelectDelta {
+    pub(super) addr: String,
+    pub(super) align: u64,
+    pub(super) inside: String,
+    pub(super) rel: String,
+    pub(super) raw: String,
+    pub(super) delta: String,
+    pub(super) dirty_marked_bytes: u64,
+}
+
+/// Cached dynamic `PageTable` translation within the current basic block. Cleared at block
+/// boundaries and any call/atomic/fence/helper.
+#[derive(Clone)]
+pub(super) struct CachedPageAddr {
+    pub(super) addr: String,
+    pub(super) align: u64,
+    pub(super) delta: String,
+    pub(super) ptr: String,
+    pub(super) verified_bytes: u64,
+    pub(super) fast_cond: Option<String>,
+}
+
+/// Cached translation of a dynamic address from a prior `guest_load`/`guest_store` in the same
+/// basic block (`WindowCheck::Branch`): lets an immediate read-modify-write store
+/// (e.g. `add [rcx], rax`), repeated access, or provably same-slot aligned access reuse `delta`,
+/// `inside`, `rel`, `ptr`, and prior dirty marks without a second window range check or table
+/// lookup. Cleared on block boundaries and any call/atomic/fence/helper.
 #[derive(Clone)]
 pub(super) struct CachedWindowAddr {
     pub(super) addr: String,
+    pub(super) align: u64,
     pub(super) inside: String,
     pub(super) rel: String,
+    pub(super) delta: String,
     pub(super) ptr: String,
+    pub(super) verified_bytes: u64,
+    pub(super) fast_cond: Option<String>,
+    pub(super) dirty_marked_bytes: u64,
 }
 
 /// The last plain guest access (`guest_load`/`guest_store`): `value` is what guest memory holds at
@@ -267,10 +311,72 @@ impl FunctionLifter<'_> {
         }
     }
 
-    /// Delta of the table slot `index` (an ordinary load: entries change at run time).
+    /// Returns `(root_ssa, disp, align)` when `addr` is provably `root_ssa + disp` with
+    /// `root_ssa` aligned to power-of-two `align` (`2 <= align <= SLOT_BYTES`) and
+    /// `0 <= disp` with `disp + bytes <= align`. Under these conditions, `[addr, addr + bytes)`
+    /// cannot wrap or straddle a 64 KiB slot boundary and lies in the exact same 64 KiB slot
+    /// (and on the same side of any 64 KiB-aligned window `[W, W + S)`) as `root_ssa`.
+    fn aligned_slot_base(&self, addr: &str, bytes: u64) -> Option<(String, u64, u64)> {
+        if bytes == 0 || bytes > SLOT_BYTES || !addr.starts_with('%') {
+            return None;
+        }
+        let (root, off) = self.affine_root(addr);
+        if off < 0 || !root.starts_with('%') {
+            return None;
+        }
+        let disp = off as u64;
+        let nz = self.nonzero_bits(&root, 64);
+        let tz = nz.trailing_zeros().min(SLOT_SHIFT);
+        if tz == 0 {
+            return None;
+        }
+        let align = 1u64 << tz;
+        let end = disp.checked_add(bytes)?;
+        (end <= align).then_some((root, disp, align))
+    }
+
+    /// True when the window's base and size are 64 KiB-aligned so any power-of-2 aligned span
+    /// `<= SLOT_BYTES` stays strictly on one side of `[w.base, w.base + w.size)`.
+    fn window_is_slot_aligned(w: Window) -> bool {
+        (w.base & (SLOT_BYTES - 1)) == 0 && (w.size & (SLOT_BYTES - 1)) == 0
+    }
+
+    /// Delta of the table slot `index` (an ordinary load: entries change at run time). Reuses any
+    /// dominating load of the exact same `(table, index)` already cached in this basic block.
     fn table_delta(&mut self, table: &str, index: &str) -> String {
+        if let Some(cached) = self
+            .slot_delta_cache
+            .iter()
+            .find(|c| c.table == table && c.index == index)
+        {
+            return cached.delta.clone();
+        }
         let entry = self.val(&format!("getelementptr i64, ptr @{table}, i64 {index}"));
         self.val(&format!("load i64, ptr {entry}, align 8"))
+    }
+
+    /// Like [`Self::table_delta`], and records the loaded delta in `slot_delta_cache`.
+    /// MUST ONLY be called on the unconditional dominating path of the current basic block so the
+    /// cached SSA value dominates every subsequent use in the block.
+    fn cached_table_delta(&mut self, table: &'static str, index: &str) -> String {
+        if let Some(cached) = self
+            .slot_delta_cache
+            .iter()
+            .find(|c| c.table == table && c.index == index)
+        {
+            return cached.delta.clone();
+        }
+        let entry = self.val(&format!("getelementptr i64, ptr @{table}, i64 {index}"));
+        let delta = self.val(&format!("load i64, ptr {entry}, align 8"));
+        if self.slot_delta_cache.len() >= MAX_SLOT_DELTA_CACHE {
+            self.slot_delta_cache.remove(0);
+        }
+        self.slot_delta_cache.push(CachedSlotDelta {
+            table,
+            index: index.to_string(),
+            delta: delta.clone(),
+        });
+        delta
     }
 
     /// Window table entry of the in-window offset `rel` ([`Self::window_offset`]).
@@ -312,8 +418,9 @@ impl FunctionLifter<'_> {
     /// On wasm64, `store atomic i8 release` lowers to `i32.atomic.store8` (`LOCK XCHG` in V8
     /// TurboFan), while `load atomic i8 monotonic` lowers to a 1-cycle `movzx`, cutting serializing
     /// fences to at most once per 64 KiB slot per flush. Emitted after the store it reports;
-    /// terminates the current block by branching to `done`.
-    fn window_mark_then_br(&mut self, index: &str, done: &str) {
+    /// terminates the current block by branching to `done` and returns the two predecessor labels
+    /// that branch to `done`.
+    fn window_mark_then_br(&mut self, index: &str, done: &str) -> [String; 2] {
         self.support.insert(Support::Memory(Decl::WindowDirty));
         // Atomic load/store: the module needs the atomics target feature (shared memory).
         self.support.insert(Support::Atomics);
@@ -322,6 +429,7 @@ impl FunctionLifter<'_> {
         ));
         let cur = self.val(&format!("load atomic i8, ptr {m} monotonic, align 1"));
         let clean = self.val(&format!("icmp eq i8 {cur}, 0"));
+        let pred = self.current_block.clone();
         let set = self.new_label("gms");
         self.emit(&format!(
             "br i1 {clean}, label %{set}, label %{done}, {UNLIKELY}"
@@ -329,6 +437,7 @@ impl FunctionLifter<'_> {
         self.start_internal_block(&set);
         self.emit(&format!("store atomic i8 1, ptr {m} release, align 1"));
         self.emit(&format!("br label %{done}"));
+        [pred, set]
     }
 
     /// O37/R57: marks window slot `index` written and continues in a fresh join block.
@@ -359,9 +468,13 @@ impl FunctionLifter<'_> {
                 let spare = w.size >> SLOT_SHIFT;
                 if w.check == WindowCheck::Select {
                     // The translation's own window test and slot index feed the mark.
-                    let SelectDelta {
-                        inside, raw, delta, ..
-                    } = self.window_select_delta(addr, w);
+                    let (
+                        SelectDelta {
+                            inside, raw, delta, ..
+                        },
+                        _,
+                        _,
+                    ) = self.window_select_delta_cached(addr, 1, w);
                     let host = self.val(&format!("add i64 {addr}, {delta}"));
                     let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
                     let index = self.val(&format!("select i1 {inside}, i64 {raw}, i64 {spare}"));
@@ -369,9 +482,8 @@ impl FunctionLifter<'_> {
                 }
                 let (inside, rel) = self.window_test(addr, w);
                 let raw = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
-                let index = self.val(&format!("select i1 {inside}, i64 {raw}, i64 {spare}"));
                 let ptr = self.guest_ptr(addr);
-                (ptr, WriteMark::Inside { inside, index })
+                (ptr, WriteMark::Inside { inside, index: raw })
             }
             _ => (self.guest_ptr(addr), WriteMark::None),
         }
@@ -395,6 +507,89 @@ impl FunctionLifter<'_> {
         }
     }
 
+    /// Computes a host pointer for `addr` given a cached `(base_ptr, delta)` and offset `disp`.
+    fn host_ptr_with_delta(&mut self, addr: &str, delta: &str, base_ptr: &str, disp: u64) -> String {
+        if disp == 0 {
+            base_ptr.to_string()
+        } else {
+            let host = self.val(&format!("add i64 {addr}, {delta}"));
+            self.val(&format!("inttoptr i64 {host} to ptr"))
+        }
+    }
+
+    /// Looks up a cached `WindowCheck::Branch` translation covering `[addr, addr + bytes)`.
+    /// Returns `(cache_index, disp_from_cached_base, is_aligned_single_slot)`.
+    fn find_cached_window_addr(
+        &self,
+        addr: &str,
+        bytes: u64,
+        w: Window,
+    ) -> Option<(usize, u64, bool)> {
+        if let Some((i, c)) = self
+            .window_load_cache
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.addr == addr && bytes <= c.verified_bytes)
+        {
+            let aligned_single = c.align > 1 && bytes <= c.align;
+            return Some((i, 0, aligned_single));
+        }
+        if Self::window_is_slot_aligned(w)
+            && let Some((root, disp, align)) = self.aligned_slot_base(addr, bytes)
+            && let Some((i, _)) = self.window_load_cache.iter().enumerate().find(|(_, c)| {
+                c.addr == root
+                    && c.fast_cond.is_none()
+                    && c.align >= align
+                    && disp.checked_add(bytes).is_some_and(|end| end <= c.align)
+            })
+        {
+            return Some((i, disp, true));
+        }
+        None
+    }
+
+    /// Looks up a cached `PageTable` translation covering `[addr, addr + bytes)`.
+    /// Returns `(cache_index, disp_from_cached_base)`.
+    fn find_cached_page_addr(&self, addr: &str, bytes: u64) -> Option<(usize, u64)> {
+        if let Some((i, _)) = self
+            .page_addr_cache
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.addr == addr && bytes <= c.verified_bytes)
+        {
+            return Some((i, 0));
+        }
+        if let Some((root, disp, align)) = self.aligned_slot_base(addr, bytes)
+            && let Some((i, _)) = self.page_addr_cache.iter().enumerate().find(|(_, c)| {
+                c.addr == root
+                    && c.fast_cond.is_none()
+                    && c.align >= align
+                    && disp.checked_add(bytes).is_some_and(|end| end <= c.align)
+            })
+        {
+            return Some((i, disp));
+        }
+        None
+    }
+
+    /// Inserts `entry` into `window_load_cache` (replacing any prior entry for the same `addr`).
+    fn push_window_load_cache(&mut self, entry: CachedWindowAddr) {
+        self.window_load_cache.retain(|c| c.addr != entry.addr);
+        if self.window_load_cache.len() >= MAX_WINDOW_LOAD_CACHE {
+            self.window_load_cache.remove(0);
+        }
+        self.window_load_cache.push(entry);
+    }
+
+    /// Inserts `entry` into `page_addr_cache` (replacing any prior entry for the same `addr`).
+    fn push_page_addr_cache(&mut self, entry: CachedPageAddr) {
+        self.page_addr_cache.retain(|c| c.addr != entry.addr);
+        if self.page_addr_cache.len() >= MAX_WINDOW_LOAD_CACHE {
+            self.page_addr_cache.remove(0);
+        }
+        self.page_addr_cache.push(entry);
+    }
+
     /// The translation seam for accesses that never straddle a 64 KiB slot (naturally aligned:
     /// atomics, single bytes) and for address-only uses.
     pub(super) fn guest_ptr(&mut self, addr: &str) -> String {
@@ -405,13 +600,20 @@ impl FunctionLifter<'_> {
                 self.flat_host(addr, base)
             }
             MemoryModel::PageTable { pages, .. } => {
+                if let Some((idx, disp)) = self.find_cached_page_addr(addr, 1)
+                    && self.page_addr_cache[idx].fast_cond.is_none()
+                {
+                    let delta = self.page_addr_cache[idx].delta.clone();
+                    let ptr = self.page_addr_cache[idx].ptr.clone();
+                    return self.host_ptr_with_delta(addr, &delta, &ptr, disp);
+                }
                 let index = if let Some(va) = const_addr(addr) {
                     self.support.insert(Support::Memory(Decl::PageTable));
                     imm((va >> SLOT_SHIFT).min(pages), 64)
                 } else {
                     self.page_index(addr, pages)
                 };
-                let delta = self.table_delta(PAGE_TABLE_SYMBOL, &index);
+                let delta = self.cached_table_delta(PAGE_TABLE_SYMBOL, &index);
                 self.val(&format!("add i64 {addr}, {delta}"))
             }
             MemoryModel::Windowed(w) if const_addr(addr).is_some() => {
@@ -422,15 +624,23 @@ impl FunctionLifter<'_> {
                 } else {
                     self.support.insert(Support::Memory(Decl::WindowTable));
                     let slot = imm(rel >> SLOT_SHIFT, 64);
-                    let delta = self.table_delta(WINDOW_TABLE_SYMBOL, &slot);
+                    let delta = self.cached_table_delta(WINDOW_TABLE_SYMBOL, &slot);
                     self.val(&format!("add i64 {addr}, {delta}"))
                 }
             }
             MemoryModel::Windowed(w) if w.check == WindowCheck::Select => {
-                let SelectDelta { delta, .. } = self.window_select_delta(addr, w);
+                let (SelectDelta { delta, .. }, _, _) =
+                    self.window_select_delta_cached(addr, 1, w);
                 self.val(&format!("add i64 {addr}, {delta}"))
             }
             MemoryModel::Windowed(w) => {
+                if let Some((idx, disp, _)) = self.find_cached_window_addr(addr, 1, w)
+                    && self.window_load_cache[idx].fast_cond.is_none()
+                {
+                    let delta = self.window_load_cache[idx].delta.clone();
+                    let ptr = self.window_load_cache[idx].ptr.clone();
+                    return self.host_ptr_with_delta(addr, &delta, &ptr, disp);
+                }
                 let (inside, rel) = self.window_test(addr, w);
                 let pred = self.current_block.clone();
                 let flat_base = self.flat_base_val(w.flat);
@@ -469,6 +679,75 @@ impl FunctionLifter<'_> {
             raw,
             delta,
         }
+    }
+
+    /// Intra-block cached [`Self::window_select_delta`]: reuses the loaded window slot delta for
+    /// repeated accesses to `addr` or provably same-slot aligned accesses `[root + disp]`.
+    /// Returns `(SelectDelta, cache_index, aligned_single_slot)`.
+    fn window_select_delta_cached(
+        &mut self,
+        addr: &str,
+        bytes: u64,
+        w: Window,
+    ) -> (SelectDelta, usize, bool) {
+        if let Some((idx, c)) = self
+            .window_select_cache
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.addr == addr)
+        {
+            let aligned_single = c.align > 1 && bytes <= c.align;
+            return (
+                SelectDelta {
+                    inside: c.inside.clone(),
+                    rel: c.rel.clone(),
+                    raw: c.raw.clone(),
+                    delta: c.delta.clone(),
+                },
+                idx,
+                aligned_single,
+            );
+        }
+        let aligned = Self::window_is_slot_aligned(w)
+            .then(|| self.aligned_slot_base(addr, bytes))
+            .flatten();
+        if let Some((ref root, disp, align)) = aligned
+            && let Some((idx, c)) = self.window_select_cache.iter().enumerate().find(|(_, c)| {
+                c.addr == *root
+                    && c.align >= align
+                    && disp.checked_add(bytes).is_some_and(|end| end <= c.align)
+            })
+        {
+            return (
+                SelectDelta {
+                    inside: c.inside.clone(),
+                    rel: c.rel.clone(),
+                    raw: c.raw.clone(),
+                    delta: c.delta.clone(),
+                },
+                idx,
+                true,
+            );
+        }
+        let (key_addr, align, aligned_single) = match aligned {
+            Some((root, _, align)) => (root, align, true),
+            None => (addr.to_string(), 1, false),
+        };
+        let sel = self.window_select_delta(&key_addr, w);
+        if self.window_select_cache.len() >= MAX_WINDOW_LOAD_CACHE {
+            self.window_select_cache.remove(0);
+        }
+        let idx = self.window_select_cache.len();
+        self.window_select_cache.push(CachedSelectDelta {
+            addr: key_addr,
+            align,
+            inside: sel.inside.clone(),
+            rel: sel.rel.clone(),
+            raw: sel.raw.clone(),
+            delta: sel.delta.clone(),
+            dirty_marked_bytes: 0,
+        });
+        (sel, idx, aligned_single)
     }
 
     /// Window path of [`WindowCheck::Outline`]: one call of the module's helper for this width.
@@ -778,16 +1057,76 @@ impl FunctionLifter<'_> {
                     }
                     self.support.insert(Support::Memory(Decl::PageTable));
                     let index = imm((va >> SLOT_SHIFT).min(pages), 64);
-                    let delta = self.table_delta(PAGE_TABLE_SYMBOL, &index);
+                    let delta = self.cached_table_delta(PAGE_TABLE_SYMBOL, &index);
                     let host = self.val(&format!("add i64 {addr}, {delta}"));
                     let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
                     return self.access_at(&ptr, &access);
                 }
+                if let Some((idx, disp)) = self.find_cached_page_addr(addr, bytes) {
+                    let cached = self.page_addr_cache[idx].clone();
+                    let use_ptr = self.host_ptr_with_delta(addr, &cached.delta, &cached.ptr, disp);
+                    if let Some(was_fast) = cached.fast_cond {
+                        let fast = self.new_label("gt");
+                        let slow = self.new_label("gs");
+                        let join = self.new_label("gj");
+                        self.emit(&format!(
+                            "br i1 {was_fast}, label %{fast}, label %{slow}, {LIKELY}"
+                        ));
+                        self.start_internal_block(&fast);
+                        if let Access::Store { .. } = access {
+                            self.access_at(&use_ptr, &access);
+                        }
+                        self.emit(&format!("br label %{join}"));
+                        self.start_internal_block(&slow);
+                        let p_slow = match access {
+                            Access::Load { .. } => Some(self.slow_read_ptr(addr, bytes)),
+                            Access::Store { ty, value } => {
+                                self.slow_store(addr, bytes, ty, value);
+                                None
+                            }
+                        };
+                        self.emit(&format!("br label %{join}"));
+                        self.start_internal_block(&join);
+                        return if let Some(p_slow) = p_slow {
+                            let ptr = self.val(&format!(
+                                "phi ptr [ {use_ptr}, %{fast} ], [ {p_slow}, %{slow} ]"
+                            ));
+                            self.access_at(&ptr, &access)
+                        } else {
+                            None
+                        };
+                    }
+                    return self.access_at(&use_ptr, &access);
+                }
+                if let Some((root, disp, align)) = self.aligned_slot_base(addr, bytes) {
+                    let index = self.page_index(&root, pages);
+                    let delta = self.cached_table_delta(PAGE_TABLE_SYMBOL, &index);
+                    let root_host = self.val(&format!("add i64 {root}, {delta}"));
+                    let root_ptr = self.val(&format!("inttoptr i64 {root_host} to ptr"));
+                    self.push_page_addr_cache(CachedPageAddr {
+                        addr: root,
+                        align,
+                        delta: delta.clone(),
+                        ptr: root_ptr.clone(),
+                        verified_bytes: align,
+                        fast_cond: None,
+                    });
+                    let use_ptr = self.host_ptr_with_delta(addr, &delta, &root_ptr, disp);
+                    return self.access_at(&use_ptr, &access);
+                }
                 if bytes <= 1 || self.contiguous_runs() {
                     let index = self.page_index(addr, pages);
-                    let delta = self.table_delta(PAGE_TABLE_SYMBOL, &index);
+                    let delta = self.cached_table_delta(PAGE_TABLE_SYMBOL, &index);
                     let host = self.val(&format!("add i64 {addr}, {delta}"));
                     let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
+                    self.push_page_addr_cache(CachedPageAddr {
+                        addr: addr.to_string(),
+                        align: 1,
+                        delta,
+                        ptr: ptr.clone(),
+                        verified_bytes: if self.contiguous_runs() { u64::MAX } else { 1 },
+                        fast_cond: None,
+                    });
                     return self.access_at(&ptr, &access);
                 }
                 let fast = self.new_label("gt");
@@ -817,6 +1156,19 @@ impl FunctionLifter<'_> {
                 };
                 self.emit(&format!("br label %{join}"));
                 self.start_internal_block(&join);
+                let was_fast = self.val(&format!("phi i1 [ true, %{fast} ], [ false, %{slow} ]"));
+                let cached_delta =
+                    self.val(&format!("phi i64 [ {delta}, %{fast} ], [ 0, %{slow} ]"));
+                let cached_ptr =
+                    self.val(&format!("phi ptr [ {p_fast}, %{fast} ], [ null, %{slow} ]"));
+                self.push_page_addr_cache(CachedPageAddr {
+                    addr: addr.to_string(),
+                    align: 1,
+                    delta: cached_delta,
+                    ptr: cached_ptr,
+                    verified_bytes: bytes,
+                    fast_cond: Some(was_fast),
+                });
                 if let Some(p_slow) = p_slow {
                     let ptr = self.val(&format!(
                         "phi ptr [ {p_fast}, %{fast} ], [ {p_slow}, %{slow} ]"
@@ -831,14 +1183,31 @@ impl FunctionLifter<'_> {
                 self.const_window_access(addr, va, bytes, w, &access)
             }
             MemoryModel::Windowed(w) if w.check == WindowCheck::Select => {
-                let sel = self.window_select_delta(addr, w);
+                let (sel, cache_idx, aligned_single) =
+                    self.window_select_delta_cached(addr, bytes, w);
                 let (inside, delta) = (sel.inside.clone(), sel.delta.clone());
-                if bytes <= 1 || self.contiguous_runs() {
+                if bytes <= 1 || self.contiguous_runs() || aligned_single {
                     let host = self.val(&format!("add i64 {addr}, {delta}"));
                     let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
                     let v = self.access_at(&ptr, &access);
                     if let Access::Store { .. } = access {
-                        self.select_marks(&sel, w, bytes);
+                        let mark_bytes = if aligned_single { 1 } else { bytes };
+                        let prev = self.window_select_cache[cache_idx].dirty_marked_bytes;
+                        let align = self.window_select_cache[cache_idx].align;
+                        let already_marked = if aligned_single {
+                            prev > 0
+                        } else {
+                            prev >= mark_bytes
+                        };
+                        if !already_marked {
+                            self.select_marks(&sel, w, mark_bytes);
+                            self.window_select_cache[cache_idx].dirty_marked_bytes =
+                                if aligned_single {
+                                    prev.max(align)
+                                } else {
+                                    prev.max(mark_bytes)
+                                };
+                        }
                     }
                     return v;
                 }
@@ -857,7 +1226,11 @@ impl FunctionLifter<'_> {
                 let p_fast = self.val(&format!("inttoptr i64 {host} to ptr"));
                 if let Access::Store { .. } = access {
                     self.access_at(&p_fast, &access);
-                    self.select_marks(&sel, w, 1);
+                    let prev = self.window_select_cache[cache_idx].dirty_marked_bytes;
+                    if prev == 0 {
+                        self.select_marks(&sel, w, 1);
+                        self.window_select_cache[cache_idx].dirty_marked_bytes = 1;
+                    }
                 }
                 self.emit(&format!("br label %{join}"));
                 self.start_internal_block(&slow);
@@ -903,39 +1276,145 @@ impl FunctionLifter<'_> {
                     _ => None,
                 }
             }
-            MemoryModel::Windowed(w) if matches!(access, Access::Store { .. }) => {
-                if (bytes <= 1 || self.contiguous_runs())
-                    && let Some(cached) = self
-                        .window_load_cache
-                        .iter()
-                        .find(|c| c.addr == addr)
-                        .cloned()
+            MemoryModel::Windowed(w) => {
+                if let Some((idx, disp, aligned_single)) =
+                    self.find_cached_window_addr(addr, bytes, w)
                 {
-                    self.access_at(&cached.ptr, &access);
-                    let mark_block = self.new_label("gm");
+                    let cached = self.window_load_cache[idx].clone();
+                    let use_ptr = self.host_ptr_with_delta(addr, &cached.delta, &cached.ptr, disp);
+                    match access {
+                        Access::Load { .. } => {
+                            if let Some(was_fast) = cached.fast_cond {
+                                let fast = self.new_label("gf");
+                                let slow = self.new_label("gs");
+                                let join = self.new_label("gj");
+                                self.emit(&format!(
+                                    "br i1 {was_fast}, label %{fast}, label %{slow}, {LIKELY}"
+                                ));
+                                self.start_internal_block(&fast);
+                                self.emit(&format!("br label %{join}"));
+                                self.start_internal_block(&slow);
+                                let p_slow = self.slow_read_ptr(addr, bytes);
+                                self.emit(&format!("br label %{join}"));
+                                self.start_internal_block(&join);
+                                let ptr = self.val(&format!(
+                                    "phi ptr [ {use_ptr}, %{fast} ], [ {p_slow}, %{slow} ]"
+                                ));
+                                return self.access_at(&ptr, &access);
+                            }
+                            return self.access_at(&use_ptr, &access);
+                        }
+                        Access::Store { ty, value } => {
+                            let mark_bytes = if aligned_single { 1 } else { bytes };
+                            let already_marked = if aligned_single {
+                                cached.dirty_marked_bytes > 0
+                            } else if cached.fast_cond.is_some() {
+                                cached.dirty_marked_bytes >= bytes
+                            } else {
+                                cached.dirty_marked_bytes >= mark_bytes
+                            };
+                            if let Some(was_fast) = cached.fast_cond {
+                                let fast = self.new_label("gf");
+                                let slow = self.new_label("gs");
+                                let join = self.new_label("gj");
+                                self.emit(&format!(
+                                    "br i1 {was_fast}, label %{fast}, label %{slow}, {LIKELY}"
+                                ));
+                                self.start_internal_block(&fast);
+                                self.access_at(&use_ptr, &access);
+                                if already_marked {
+                                    self.emit(&format!("br label %{join}"));
+                                } else {
+                                    let mark_block = self.new_label("gm");
+                                    self.emit(&format!(
+                                        "br i1 {}, label %{mark_block}, label %{join}, {UNLIKELY}",
+                                        cached.inside
+                                    ));
+                                    self.start_internal_block(&mark_block);
+                                    let index =
+                                        self.val(&format!("lshr i64 {}, {SLOT_SHIFT}", cached.rel));
+                                    self.window_mark_then_br(&index, &join);
+                                }
+                                self.start_internal_block(&slow);
+                                self.slow_store(addr, bytes, ty, value);
+                                self.emit(&format!("br label %{join}"));
+                                self.start_internal_block(&join);
+                                self.window_load_cache[idx].dirty_marked_bytes =
+                                    cached.dirty_marked_bytes.max(cached.verified_bytes);
+                                return None;
+                            }
+                            self.access_at(&use_ptr, &access);
+                            if !already_marked {
+                                let mark_block = self.new_label("gm");
+                                let join = self.new_label("gj");
+                                self.emit(&format!(
+                                    "br i1 {}, label %{mark_block}, label %{join}, {UNLIKELY}",
+                                    cached.inside
+                                ));
+                                self.start_internal_block(&mark_block);
+                                let index =
+                                    self.val(&format!("lshr i64 {}, {SLOT_SHIFT}", cached.rel));
+                                self.emit_window_store_marks(&index, &cached.rel, mark_bytes, &join);
+                                self.start_internal_block(&join);
+                                self.window_load_cache[idx].dirty_marked_bytes = if aligned_single {
+                                    cached.dirty_marked_bytes.max(cached.align)
+                                } else {
+                                    cached.dirty_marked_bytes.max(mark_bytes)
+                                };
+                            }
+                            return None;
+                        }
+                    }
+                }
+                if Self::window_is_slot_aligned(w)
+                    && let Some((root, disp, align)) = self.aligned_slot_base(addr, bytes)
+                {
+                    let (inside, rel) = self.window_test(&root, w);
+                    let pred = self.current_block.clone();
+                    let flat_base = self.flat_base_val(w.flat);
+                    let win = self.new_label("gw");
                     let join = self.new_label("gj");
                     self.emit(&format!(
-                        "br i1 {}, label %{mark_block}, label %{join}, {UNLIKELY}",
-                        cached.inside
+                        "br i1 {inside}, label %{win}, label %{join}, {UNLIKELY}"
                     ));
-                    self.start_internal_block(&mark_block);
-                    let index = self.val(&format!("lshr i64 {}, {SLOT_SHIFT}", cached.rel));
-                    self.emit_window_store_marks(&index, &cached.rel, bytes, &join);
+                    self.start_internal_block(&win);
+                    let delta_win = self.window_entry(&rel);
+                    self.emit(&format!("br label %{join}"));
                     self.start_internal_block(&join);
-                    return None;
+                    let delta = self.val(&format!(
+                        "phi i64 [ {flat_base}, %{pred} ], [ {delta_win}, %{win} ]"
+                    ));
+                    let root_host = self.val(&format!("add i64 {root}, {delta}"));
+                    let root_ptr = self.val(&format!("inttoptr i64 {root_host} to ptr"));
+                    let use_ptr = self.host_ptr_with_delta(addr, &delta, &root_ptr, disp);
+                    let v = self.access_at(&use_ptr, &access);
+                    if is_store {
+                        let mark_block = self.new_label("gm");
+                        let done = self.new_label("gj");
+                        self.emit(&format!(
+                            "br i1 {inside}, label %{mark_block}, label %{done}, {UNLIKELY}"
+                        ));
+                        self.start_internal_block(&mark_block);
+                        let index = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
+                        self.window_mark_then_br(&index, &done);
+                        self.start_internal_block(&done);
+                    }
+                    self.push_window_load_cache(CachedWindowAddr {
+                        addr: root,
+                        align,
+                        inside,
+                        rel,
+                        delta,
+                        ptr: root_ptr,
+                        verified_bytes: align,
+                        fast_cond: None,
+                        dirty_marked_bytes: if is_store { align } else { 0 },
+                    });
+                    return v;
                 }
-                self.window_store(addr, bytes, w, &access);
-                None
-            }
-            MemoryModel::Windowed(w) => {
-                if (bytes <= 1 || self.contiguous_runs())
-                    && let Some(cached) = self
-                        .window_load_cache
-                        .iter()
-                        .find(|c| c.addr == addr)
-                        .cloned()
-                {
-                    return self.access_at(&cached.ptr, &access);
+                if is_store {
+                    self.window_store(addr, bytes, w, &access);
+                    return None;
                 }
                 let (inside, rel) = self.window_test(addr, w);
                 let pred = self.current_block.clone();
@@ -955,14 +1434,16 @@ impl FunctionLifter<'_> {
                     ));
                     let host = self.val(&format!("add i64 {addr}, {delta}"));
                     let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
-                    if self.window_load_cache.len() >= MAX_WINDOW_LOAD_CACHE {
-                        self.window_load_cache.remove(0);
-                    }
-                    self.window_load_cache.push(CachedWindowAddr {
+                    self.push_window_load_cache(CachedWindowAddr {
                         addr: addr.to_string(),
+                        align: 1,
                         inside,
                         rel,
+                        delta,
                         ptr: ptr.clone(),
+                        verified_bytes: if self.contiguous_runs() { u64::MAX } else { 1 },
+                        fast_cond: None,
+                        dirty_marked_bytes: 0,
                     });
                     return self.access_at(&ptr, &access);
                 }
@@ -989,28 +1470,31 @@ impl FunctionLifter<'_> {
                 ));
                 let host = self.val(&format!("add i64 {addr}, {delta}"));
                 let p_fast = self.val(&format!("inttoptr i64 {host} to ptr"));
-                if let Access::Store { .. } = access {
-                    self.access_at(&p_fast, &access);
-                }
                 self.emit(&format!("br label %{join}"));
                 self.start_internal_block(&slow);
-                let p_slow = match access {
-                    Access::Load { .. } => Some(self.slow_read_ptr(addr, bytes)),
-                    Access::Store { ty, value } => {
-                        self.slow_store(addr, bytes, ty, value);
-                        None
-                    }
-                };
+                let p_slow = self.slow_read_ptr(addr, bytes);
                 self.emit(&format!("br label %{join}"));
                 self.start_internal_block(&join);
-                if let Some(p_slow) = p_slow {
-                    let ptr = self.val(&format!(
-                        "phi ptr [ {p_fast}, %{fast} ], [ {p_slow}, %{slow} ]"
-                    ));
-                    self.access_at(&ptr, &access)
-                } else {
-                    None
-                }
+                let was_fast = self.val(&format!("phi i1 [ true, %{fast} ], [ false, %{slow} ]"));
+                let cached_delta =
+                    self.val(&format!("phi i64 [ {delta}, %{fast} ], [ 0, %{slow} ]"));
+                let cached_ptr =
+                    self.val(&format!("phi ptr [ {p_fast}, %{fast} ], [ null, %{slow} ]"));
+                self.push_window_load_cache(CachedWindowAddr {
+                    addr: addr.to_string(),
+                    align: 1,
+                    inside,
+                    rel,
+                    delta: cached_delta,
+                    ptr: cached_ptr,
+                    verified_bytes: bytes,
+                    fast_cond: Some(was_fast),
+                    dirty_marked_bytes: 0,
+                });
+                let ptr = self.val(&format!(
+                    "phi ptr [ {p_fast}, %{fast} ], [ {p_slow}, %{slow} ]"
+                ));
+                self.access_at(&ptr, &access)
             }
         }
     }
@@ -1051,7 +1535,7 @@ impl FunctionLifter<'_> {
         self.support.insert(Support::Memory(Decl::WindowTable));
         let slot_idx = rel >> SLOT_SHIFT;
         let slot_imm = imm(slot_idx, 64);
-        let delta = self.table_delta(WINDOW_TABLE_SYMBOL, &slot_imm);
+        let delta = self.cached_table_delta(WINDOW_TABLE_SYMBOL, &slot_imm);
         let host = self.val(&format!("add i64 {addr}, {delta}"));
         let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
         let v = self.access_at(&ptr, access);
@@ -1068,7 +1552,8 @@ impl FunctionLifter<'_> {
     }
 
     /// Emits the dirty mark(s) for a confirmed in-window store and branches to `join`.
-    fn emit_window_store_marks(&mut self, index: &str, rel: &str, bytes: u64, join: &str) {
+    /// Returns the two predecessor labels that branch directly to `join`.
+    fn emit_window_store_marks(&mut self, index: &str, rel: &str, bytes: u64, join: &str) -> [String; 2] {
         if bytes > 1 && self.contiguous_runs() {
             self.window_mark(index);
             // The slot of the last byte needs its own mark only when the store crosses into it
@@ -1078,6 +1563,7 @@ impl FunctionLifter<'_> {
             let last = self.val(&format!("add i64 {rel}, {}", bytes - 1));
             let last_index = self.val(&format!("lshr i64 {last}, {SLOT_SHIFT}"));
             let crosses = self.val(&format!("icmp ne i64 {last_index}, {index}"));
+            let pred = self.current_block.clone();
             let mark_last = self.new_label("gm");
             self.emit(&format!(
                 "br i1 {crosses}, label %{mark_last}, label %{join}, {UNLIKELY}"
@@ -1090,8 +1576,9 @@ impl FunctionLifter<'_> {
             ));
             self.emit(&format!("store atomic i8 1, ptr {m2} release, align 1"));
             self.emit(&format!("br label %{join}"));
+            [pred, mark_last]
         } else {
-            self.window_mark_then_br(index, join);
+            self.window_mark_then_br(index, join)
         }
     }
 
@@ -1102,6 +1589,7 @@ impl FunctionLifter<'_> {
     /// straddle check the loads have too.
     fn window_store(&mut self, addr: &str, bytes: u64, w: Window, access: &Access<'_>) {
         let (inside, rel) = self.window_test(addr, w);
+        let flat_base = self.flat_base_val(w.flat);
         let win = self.new_label("gw");
         let flat = self.new_label("gf");
         let join = self.new_label("gj");
@@ -1133,13 +1621,48 @@ impl FunctionLifter<'_> {
         let host = self.val(&format!("add i64 {addr}, {delta}"));
         let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
         self.access_at(&ptr, access);
-        self.emit_window_store_marks(&index, &rel, bytes, &join);
-        if let (Some(slow), Access::Store { ty, value }) = (slow, access) {
-            self.start_internal_block(&slow);
+        let [wp0, wp1] = self.emit_window_store_marks(&index, &rel, bytes, &join);
+        if let (Some(slow), Access::Store { ty, value }) = (&slow, access) {
+            self.start_internal_block(slow);
             self.slow_store(addr, bytes, ty, value);
             self.emit(&format!("br label %{join}"));
         }
         self.start_internal_block(&join);
+        let (cached_delta, cached_ptr, fast_cond) = if let Some(slow) = slow {
+            let cd = self.val(&format!(
+                "phi i64 [ {flat_base}, %{flat} ], [ {delta}, %{wp0} ], [ {delta}, %{wp1} ], [ 0, %{slow} ]"
+            ));
+            let cp = self.val(&format!(
+                "phi ptr [ {p_flat}, %{flat} ], [ {ptr}, %{wp0} ], [ {ptr}, %{wp1} ], [ null, %{slow} ]"
+            ));
+            let wf = self.val(&format!(
+                "phi i1 [ true, %{flat} ], [ true, %{wp0} ], [ true, %{wp1} ], [ false, %{slow} ]"
+            ));
+            (cd, cp, Some(wf))
+        } else {
+            let cd = self.val(&format!(
+                "phi i64 [ {flat_base}, %{flat} ], [ {delta}, %{wp0} ], [ {delta}, %{wp1} ]"
+            ));
+            let cp = self.val(&format!(
+                "phi ptr [ {p_flat}, %{flat} ], [ {ptr}, %{wp0} ], [ {ptr}, %{wp1} ]"
+            ));
+            (cd, cp, None)
+        };
+        self.push_window_load_cache(CachedWindowAddr {
+            addr: addr.to_string(),
+            align: 1,
+            inside,
+            rel,
+            delta: cached_delta,
+            ptr: cached_ptr,
+            verified_bytes: if self.contiguous_runs() {
+                u64::MAX
+            } else {
+                bytes
+            },
+            fast_cond,
+            dirty_marked_bytes: bytes,
+        });
     }
 
     /// O37: marks of a store under the branch-free window check: the slot (the spare entry
@@ -1570,6 +2093,7 @@ impl FunctionLifter<'_> {
         len: &str,
         emit: impl Fn(&mut Self, Option<&[String]>),
     ) -> R<bool> {
+        self.clear_window_cache();
         match self.memory {
             MemoryModel::Base(_) => Ok(false),
             MemoryModel::PageTable { .. } => {

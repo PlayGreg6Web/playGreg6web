@@ -6,7 +6,10 @@
 
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
 
-use super::{Flag, FunctionLifter, R, RBP, RSP, imm, unsupported};
+use super::{
+    ColdTrapKind, Flag, FlagSource, FunctionLifter, R, RBP, RSP, RegRef, imm, mask, parse_const,
+    reg_ref, sign_extend_u64, ty, unsupported,
+};
 use crate::lift::{RuntimeHelper, Support};
 
 pub(super) const RAX: usize = 0;
@@ -189,6 +192,13 @@ impl FunctionLifter<'_> {
             | M::Monitorx
             | M::Mwaitx => Ok(()),
             M::Clzero => self.clzero(ins),
+            M::Imul if ins.op_count() >= 2 => self.opt_imul_truncating(ins),
+            M::Imul | M::Mul => self.opt_mul_widening(ins, ins.mnemonic() == M::Imul),
+            M::Div | M::Idiv => self.opt_divide(ins, ins.mnemonic() == M::Idiv),
+            M::Neg => self.opt_neg(ins),
+            M::Cwd | M::Cdq | M::Cqo => self.opt_sign_extend_dx(ins),
+            M::Cbw | M::Cwde | M::Cdqe => self.opt_sign_extend_ax(ins),
+            M::Movzx | M::Movsx | M::Movsxd => self.opt_mov_extend(ins),
             _ => return None,
         };
         Some(result)
@@ -513,5 +523,818 @@ impl FunctionLifter<'_> {
                 ins.mnemonic()
             )),
         }
+    }
+
+    // ----- bit-exact constant folding & strength reduction for mul/div/neg/ext -----------------
+
+    /// Truncating `imul r, r/m` and `imul r, r/m, imm` with bit-exact constant folding and
+    /// identity / `-1` / `±2^k` strength reduction (eliminating `mul` and 64-bit `@__playgta6_umul128`
+    /// even when `CF`/`OF` are live). Always evaluates memory operands first so `#PF` is preserved.
+    fn opt_imul_truncating(&mut self, ins: &Instruction) -> R<()> {
+        let bits = self.op_bits(ins, 0)?;
+        let t = ty(bits);
+        let (a, b) = if ins.op_count() == 3 {
+            let src_bits = self.op_bits(ins, 1)?;
+            if src_bits != bits {
+                return unsupported("imul operand size");
+            }
+            (self.read_op(ins, 1, bits)?, self.read_op(ins, 2, bits)?)
+        } else {
+            (self.read_op(ins, 0, bits)?, self.read_op(ins, 1, bits)?)
+        };
+        let ca = parse_const(&a, bits);
+        let cb = parse_const(&b, bits);
+        let want_ov = self.flag_live(Flag::Cf) || self.flag_live(Flag::Of);
+
+        if let (Some(va), Some(vb)) = (ca, cb) {
+            let sa = i128::from(sign_extend_u64(va, bits) as i64);
+            let sb = i128::from(sign_extend_u64(vb, bits) as i64);
+            let prod = sa * sb;
+            let trunc = (prod as u64) & mask(bits);
+            let ov = i128::from(sign_extend_u64(trunc, bits) as i64) != prod;
+            let ov_s = if ov { "true" } else { "false" };
+            self.set_flag(Flag::Cf, ov_s);
+            self.set_flag(Flag::Of, ov_s);
+            return self.write_op(ins, 0, &imm(trunc, bits), bits);
+        }
+
+        // Normalize `(dyn_val, const_val)` when exactly one operand is a lift-time constant.
+        let one_const = match (ca, cb) {
+            (None, Some(c)) => Some((a.as_str(), c)),
+            (Some(c), None) => Some((b.as_str(), c)),
+            _ => None,
+        };
+        if let Some((x, c)) = one_const {
+            let m = mask(bits);
+            let c_masked = c & m;
+            if c_masked == 0 {
+                self.set_flag(Flag::Cf, "false");
+                self.set_flag(Flag::Of, "false");
+                return self.write_op(ins, 0, "0", bits);
+            }
+            if c_masked == 1 {
+                self.set_flag(Flag::Cf, "false");
+                self.set_flag(Flag::Of, "false");
+                return self.write_op(ins, 0, x, bits);
+            }
+            if c_masked == m {
+                // `x * -1 = -x`; overflows signed `bits` iff `x == INT_MIN`.
+                let r = self.val(&format!("sub {t} 0, {x}"));
+                if want_ov {
+                    let min_val = imm(1u64 << (bits - 1), bits);
+                    let ov = self.val(&format!("icmp eq {t} {x}, {min_val}"));
+                    self.set_flag(Flag::Cf, &ov);
+                    self.set_flag(Flag::Of, &ov);
+                }
+                return self.write_op(ins, 0, &r, bits);
+            }
+            let c_signed = sign_extend_u64(c_masked, bits) as i64;
+            if c_signed > 0 && (c_signed as u64).is_power_of_two() {
+                // Positive power of two `2^k` (`1 <= k <= bits - 2`): `r = x << k`,
+                // overflows signed `bits` iff `(r >>a k) != x`.
+                let k = (c_signed as u64).trailing_zeros();
+                let r = self.val(&format!("shl {t} {x}, {k}"));
+                if want_ov {
+                    let back = self.val(&format!("ashr {t} {r}, {k}"));
+                    let ov = self.val(&format!("icmp ne {t} {back}, {x}"));
+                    self.set_flag(Flag::Cf, &ov);
+                    self.set_flag(Flag::Of, &ov);
+                }
+                return self.write_op(ins, 0, &r, bits);
+            }
+            if c_signed < 0 && c_signed.unsigned_abs().is_power_of_two() {
+                let k = c_signed.unsigned_abs().trailing_zeros();
+                if k == bits - 1 {
+                    // `c == INT_MIN = -2^(bits-1)`: truncated product is `x << (bits - 1)`;
+                    // fits in signed `bits` iff `x == 0` or `x == 1` (`x <=u 1`).
+                    let r = self.val(&format!("shl {t} {x}, {k}"));
+                    if want_ov {
+                        let ov = self.val(&format!("icmp ugt {t} {x}, 1"));
+                        self.set_flag(Flag::Cf, &ov);
+                        self.set_flag(Flag::Of, &ov);
+                    }
+                    return self.write_op(ins, 0, &r, bits);
+                }
+                // Negative power of two `-2^k` (`1 <= k <= bits - 2`):
+                // `r = -(x << k)`; fits in signed `bits` iff
+                // `-(2^(bits-1-k)) + 1 <=s x <=s 2^(bits-1-k)`, i.e.
+                // `(x + (2^(bits-1-k) - 1)) <=u (2^(bits-k) - 1)`.
+                let sh = self.val(&format!("shl {t} {x}, {k}"));
+                let r = self.val(&format!("sub {t} 0, {sh}"));
+                if want_ov {
+                    let lo_neg = imm((1u64 << (bits - 1 - k)) - 1, bits);
+                    let span = imm((1u64 << (bits - k)) - 1, bits);
+                    let shifted = self.val(&format!("add {t} {x}, {lo_neg}"));
+                    let ov = self.val(&format!("icmp ugt {t} {shifted}, {span}"));
+                    self.set_flag(Flag::Cf, &ov);
+                    self.set_flag(Flag::Of, &ov);
+                }
+                return self.write_op(ins, 0, &r, bits);
+            }
+        }
+
+        if !want_ov {
+            let r = self.val(&format!("mul {t} {a}, {b}"));
+            return self.write_op(ins, 0, &r, bits);
+        }
+        let (r, overflow) = if bits == 64 {
+            let r = self.val(&format!("mul i64 {a}, {b}"));
+            let (_, hi) = self.mul128(&a, &b, true);
+            let sign = self.val(&format!("ashr i64 {r}, 63"));
+            let ov = self.val(&format!("icmp ne i64 {hi}, {sign}"));
+            (r, ov)
+        } else {
+            let wa = self.val(&format!("sext {t} {a} to i64"));
+            let wb = self.val(&format!("sext {t} {b} to i64"));
+            let p = self.val(&format!("mul i64 {wa}, {wb}"));
+            let r = self.val(&format!("trunc i64 {p} to {t}"));
+            let back = self.val(&format!("sext {t} {r} to i64"));
+            let ov = self.val(&format!("icmp ne i64 {back}, {p}"));
+            (r, ov)
+        };
+        self.set_flag(Flag::Cf, &overflow);
+        self.set_flag(Flag::Of, &overflow);
+        self.write_op(ins, 0, &r, bits)
+    }
+
+    /// One-operand widening `mul`/`imul` with bit-exact constant folding and `0`/`1`/`-1`/`2^k`
+    /// strength reduction (eliminating 64-bit `@__playgta6_umul128` for all special factors).
+    fn opt_mul_widening(&mut self, ins: &Instruction, signed: bool) -> R<()> {
+        let bits = self.op_bits(ins, 0)?;
+        let t = ty(bits);
+        let src = self.read_op(ins, 0, bits)?;
+        let (acc, dst_hi) = match bits {
+            8 => (Register::AL, Register::AH),
+            16 => (Register::AX, Register::DX),
+            32 => (Register::EAX, Register::EDX),
+            _ => (Register::RAX, Register::RDX),
+        };
+        let (a, _) = self.read_reg(acc)?;
+        let want_ov = self.flag_live(Flag::Cf) || self.flag_live(Flag::Of);
+        let ca = parse_const(&a, bits);
+        let cb = parse_const(&src, bits);
+        let m = mask(bits);
+
+        if let (Some(va), Some(vb)) = (ca, cb) {
+            let (prod_lo, prod_hi, ax16, ov) = if signed {
+                let sa = i128::from(sign_extend_u64(va, bits) as i64);
+                let sb = i128::from(sign_extend_u64(vb, bits) as i64);
+                let prod = sa * sb;
+                let lo = (prod as u64) & m;
+                let hi = ((prod >> bits) as u64) & m;
+                let ov = i128::from(sign_extend_u64(lo, bits) as i64) != prod;
+                (lo, hi, (prod as u64) & 0xFFFF, ov)
+            } else {
+                let prod = u128::from(va & m) * u128::from(vb & m);
+                let lo = (prod as u64) & m;
+                let hi = ((prod >> bits) as u64) & m;
+                let ov = hi != 0;
+                (lo, hi, (prod as u64) & 0xFFFF, ov)
+            };
+            if bits == 8 {
+                self.write_reg(Register::AX, &imm(ax16, 16), 16)?;
+            } else {
+                self.write_reg(acc, &imm(prod_lo, bits), bits)?;
+                self.write_reg(dst_hi, &imm(prod_hi, bits), bits)?;
+            }
+            if want_ov {
+                let ov_s = if ov { "true" } else { "false" };
+                self.set_flag(Flag::Cf, ov_s);
+                self.set_flag(Flag::Of, ov_s);
+            }
+            return Ok(());
+        }
+
+        let one_const = match (ca, cb) {
+            (None, Some(c)) => Some((a.as_str(), c & m)),
+            (Some(c), None) => Some((src.as_str(), c & m)),
+            _ => None,
+        };
+        if let Some((x, c)) = one_const {
+            if c == 0 {
+                if bits == 8 {
+                    self.write_reg(Register::AX, "0", 16)?;
+                } else {
+                    self.write_reg(acc, "0", bits)?;
+                    self.write_reg(dst_hi, "0", bits)?;
+                }
+                if want_ov {
+                    self.set_flag(Flag::Cf, "false");
+                    self.set_flag(Flag::Of, "false");
+                }
+                return Ok(());
+            }
+            if c == 1 {
+                if bits == 8 {
+                    let ext = if signed { "sext" } else { "zext" };
+                    let ax = self.val(&format!("{ext} i8 {x} to i16"));
+                    self.write_reg(Register::AX, &ax, 16)?;
+                } else {
+                    let hi = if signed {
+                        self.val(&format!("ashr {t} {x}, {}", bits - 1))
+                    } else {
+                        "0".to_string()
+                    };
+                    self.write_reg(acc, x, bits)?;
+                    self.write_reg(dst_hi, &hi, bits)?;
+                }
+                if want_ov {
+                    self.set_flag(Flag::Cf, "false");
+                    self.set_flag(Flag::Of, "false");
+                }
+                return Ok(());
+            }
+            if signed && c == m {
+                // Signed `x * -1`: `lo = -x`, `hi = (x >s 0) ? -1 : 0` (note: for `x == INT_MIN`,
+                // product is `+2^(bits-1)` so `lo = INT_MIN` and `hi = 0`!), `ov = (x == INT_MIN)`.
+                let ov = want_ov.then(|| {
+                    let min_val = imm(1u64 << (bits - 1), bits);
+                    self.val(&format!("icmp eq {t} {x}, {min_val}"))
+                });
+                if bits == 8 {
+                    let ext = self.val(&format!("sext i8 {x} to i16"));
+                    let ax = self.val(&format!("sub i16 0, {ext}"));
+                    self.write_reg(Register::AX, &ax, 16)?;
+                } else {
+                    let lo = self.val(&format!("sub {t} 0, {x}"));
+                    let pos = self.val(&format!("icmp sgt {t} {x}, 0"));
+                    let hi = self.val(&format!("sext i1 {pos} to {t}"));
+                    self.write_reg(acc, &lo, bits)?;
+                    self.write_reg(dst_hi, &hi, bits)?;
+                }
+                if let Some(ov) = ov {
+                    self.set_flag(Flag::Cf, &ov);
+                    self.set_flag(Flag::Of, &ov);
+                }
+                return Ok(());
+            }
+            if !signed && bits > 8 && c.is_power_of_two() {
+                // Unsigned `x * 2^k` (`1 <= k <= bits - 1`): `lo = x << k`, `hi = x >>u (bits - k)`.
+                let k = c.trailing_zeros();
+                let lo = self.val(&format!("shl {t} {x}, {k}"));
+                let hi = self.val(&format!("lshr {t} {x}, {}", bits - k));
+                let ov = want_ov.then(|| self.val(&format!("icmp ne {t} {hi}, 0")));
+                self.write_reg(acc, &lo, bits)?;
+                self.write_reg(dst_hi, &hi, bits)?;
+                if let Some(ov) = ov {
+                    self.set_flag(Flag::Cf, &ov);
+                    self.set_flag(Flag::Of, &ov);
+                }
+                return Ok(());
+            }
+            if signed && bits > 8 {
+                let c_signed = sign_extend_u64(c, bits) as i64;
+                if c_signed > 0 && (c_signed as u64).is_power_of_two() {
+                    // Signed `x * (+2^k)` (`1 <= k <= bits - 2`):
+                    // `lo = x << k`, `hi = x >>a (bits - k)`, `ov = (hi != (lo >>a (bits - 1)))`.
+                    let k = (c_signed as u64).trailing_zeros();
+                    let lo = self.val(&format!("shl {t} {x}, {k}"));
+                    let hi = self.val(&format!("ashr {t} {x}, {}", bits - k));
+                    let ov = want_ov.then(|| {
+                        let sign = self.val(&format!("ashr {t} {lo}, {}", bits - 1));
+                        self.val(&format!("icmp ne {t} {hi}, {sign}"))
+                    });
+                    self.write_reg(acc, &lo, bits)?;
+                    self.write_reg(dst_hi, &hi, bits)?;
+                    if let Some(ov) = ov {
+                        self.set_flag(Flag::Cf, &ov);
+                        self.set_flag(Flag::Of, &ov);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // General widening multiply (same lowering as `FunctionLifter::mul_widening`, reusing
+        // already-loaded `src` and `a` without re-reading any memory operand).
+        let overflow = if bits == 64 {
+            let (lo, hi) = self.mul128(&a, &src, signed);
+            let ov = want_ov.then(|| {
+                if signed {
+                    let sign = self.val(&format!("ashr i64 {lo}, 63"));
+                    self.val(&format!("icmp ne i64 {hi}, {sign}"))
+                } else {
+                    self.val(&format!("icmp ne i64 {hi}, 0"))
+                }
+            });
+            self.write_reg(Register::RAX, &lo, 64)?;
+            self.write_reg(Register::RDX, &hi, 64)?;
+            ov
+        } else {
+            let ext = if signed { "sext" } else { "zext" };
+            let wa = self.val(&format!("{ext} {t} {a} to i64"));
+            let wb = self.val(&format!("{ext} {t} {src} to i64"));
+            let p = self.val(&format!("mul i64 {wa}, {wb}"));
+            let lo = self.val(&format!("trunc i64 {p} to {t}"));
+            let high = (bits != 8 || (want_ov && !signed))
+                .then(|| self.val(&format!("lshr i64 {p}, {bits}")));
+            let ov = want_ov.then(|| {
+                if signed {
+                    let back = self.val(&format!("sext {t} {lo} to i64"));
+                    self.val(&format!("icmp ne i64 {back}, {p}"))
+                } else {
+                    self.val(&format!("icmp ne i64 {}, 0", high.as_ref().unwrap()))
+                }
+            });
+            if bits == 8 {
+                let ax = self.val(&format!("trunc i64 {p} to i16"));
+                self.write_reg(Register::AX, &ax, 16)?;
+            } else {
+                let hi = self.val(&format!("trunc i64 {} to {t}", high.unwrap()));
+                self.write_reg(acc, &lo, bits)?;
+                self.write_reg(dst_hi, &hi, bits)?;
+            }
+            ov
+        };
+        if let Some(overflow) = overflow {
+            self.set_flag(Flag::Cf, &overflow);
+            self.set_flag(Flag::Of, &overflow);
+        }
+        Ok(())
+    }
+
+    /// `div`/`idiv` with bit-exact constant folding, power-of-two / identity strength reduction,
+    /// and statically provable trap elision while strictly preserving `#DE` divide-by-zero and
+    /// `INT_MIN / -1` / quotient-overflow trap semantics.
+    fn opt_divide(&mut self, ins: &Instruction, signed: bool) -> R<()> {
+        let bits = self.op_bits(ins, 0)?;
+        let t = ty(bits);
+        let divisor = self.read_op(ins, 0, bits)?;
+        let cd = parse_const(&divisor, bits);
+
+        // Constant divide by zero: trap `#DE` unconditionally without writing RAX/RDX.
+        if cd == Some(0) {
+            self.cold_trap_branch("true", ColdTrapKind::DivideError, ins.ip());
+            return Ok(());
+        }
+
+        let (qreg, rreg) = match bits {
+            8 => (Register::AL, Register::AH),
+            16 => (Register::AX, Register::DX),
+            32 => (Register::EAX, Register::EDX),
+            _ => (Register::RAX, Register::RDX),
+        };
+
+        // Fast paths when `divisor` is a known non-zero constant and high half is known zero
+        // (unsigned 32/64-bit) or sign-extended via `cdq`/`cqo` (signed 32/64-bit).
+        if matches!(bits, 32 | 64)
+            && let Some(vd) = cd
+        {
+            if !signed
+                && self.known.gprs[RDX]
+                    .as_deref()
+                    .and_then(super::memory_access::const_addr)
+                    .is_some_and(|v| (v & mask(bits)) == 0)
+            {
+                let (lo, _) = self.read_reg(qreg)?;
+                if let Some(vlo) = parse_const(&lo, bits) {
+                    let q = imm(vlo / vd, bits);
+                    let r = imm(vlo % vd, bits);
+                    self.write_reg(qreg, &q, bits)?;
+                    return self.write_reg(rreg, &r, bits);
+                }
+                let (q, r) = if vd == 1 {
+                    (lo, "0".to_string())
+                } else if vd.is_power_of_two() {
+                    let k = vd.trailing_zeros();
+                    let q = self.val(&format!("lshr {t} {lo}, {k}"));
+                    let r = self.val(&format!("and {t} {lo}, {}", imm(vd - 1, bits)));
+                    (q, r)
+                } else {
+                    // `vd != 0` and `hi == 0`, so `#DE` is impossible.
+                    let q = self.val(&format!("udiv {t} {lo}, {divisor}"));
+                    let r = self.val(&format!("urem {t} {lo}, {divisor}"));
+                    (q, r)
+                };
+                self.write_reg(qreg, &q, bits)?;
+                return self.write_reg(rreg, &r, bits);
+            }
+            if signed
+                && matches!(
+                    &self.known.sign_ext_rdx,
+                    Some((rdx64, rax64, b))
+                        if *b == bits
+                            && self.known.gprs[RDX].as_deref() == Some(rdx64.as_str())
+                            && self.known.gprs[RAX].as_deref() == Some(rax64.as_str())
+                )
+            {
+                let (lo, _) = self.read_reg(qreg)?;
+                let sd = sign_extend_u64(vd, bits) as i64;
+                if sd == 1 {
+                    // `lo / 1 == lo`, `lo % 1 == 0`; never overflows (even for `INT_MIN`).
+                    self.write_reg(qreg, &lo, bits)?;
+                    return self.write_reg(rreg, "0", bits);
+                }
+                if sd == -1 {
+                    let min_u = 1u64 << (bits - 1);
+                    if let Some(vlo) = parse_const(&lo, bits) {
+                        if vlo == min_u {
+                            self.cold_trap_branch("true", ColdTrapKind::DivideError, ins.ip());
+                            return Ok(());
+                        }
+                        let q = imm(0u64.wrapping_sub(vlo) & mask(bits), bits);
+                        self.write_reg(qreg, &q, bits)?;
+                        return self.write_reg(rreg, "0", bits);
+                    }
+                    let min_imm = imm(min_u, bits);
+                    let fault = self.val(&format!("icmp eq {t} {lo}, {min_imm}"));
+                    self.cold_trap_branch(&fault, ColdTrapKind::DivideError, ins.ip());
+                    let q = self.val(&format!("sub {t} 0, {lo}"));
+                    self.write_reg(qreg, &q, bits)?;
+                    return self.write_reg(rreg, "0", bits);
+                }
+                // `sd != 0 && sd != -1` with sign-extended `rdx`: `#DE` is impossible!
+                if let Some(vlo) = parse_const(&lo, bits) {
+                    let slo = sign_extend_u64(vlo, bits) as i64;
+                    let q = imm((slo / sd) as u64, bits);
+                    let r = imm((slo % sd) as u64, bits);
+                    self.write_reg(qreg, &q, bits)?;
+                    return self.write_reg(rreg, &r, bits);
+                }
+                let q = self.val(&format!("sdiv {t} {lo}, {divisor}"));
+                let r = self.val(&format!("srem {t} {lo}, {divisor}"));
+                self.write_reg(qreg, &q, bits)?;
+                return self.write_reg(rreg, &r, bits);
+            }
+        }
+
+        // Full constant folding for any width (8/16/32/64-bit) when the entire 2N-bit dividend
+        // and non-zero divisor are lift-time constants.
+        if let Some(vd) = cd {
+            let const_hi_lo = if bits == 8 {
+                let (ax, _) = self.read_reg(Register::AX)?;
+                parse_const(&ax, 16).map(|v| ((v >> 8) & 0xFF, v & 0xFF))
+            } else {
+                let (h, _) = self.read_reg(rreg)?;
+                let (l, _) = self.read_reg(qreg)?;
+                match (parse_const(&h, bits), parse_const(&l, bits)) {
+                    (Some(vh), Some(vl)) => Some((vh, vl)),
+                    _ => None,
+                }
+            };
+            if let Some((vh, vl)) = const_hi_lo {
+                if !signed {
+                    if vh >= vd {
+                        self.cold_trap_branch("true", ColdTrapKind::DivideError, ins.ip());
+                        return Ok(());
+                    }
+                    let dividend = (u128::from(vh) << bits) | u128::from(vl);
+                    let d128 = u128::from(vd);
+                    let q = imm((dividend / d128) as u64, bits);
+                    let r = imm((dividend % d128) as u64, bits);
+                    self.write_reg(qreg, &q, bits)?;
+                    return self.write_reg(rreg, &r, bits);
+                }
+                let sh = i128::from(sign_extend_u64(vh, bits) as i64);
+                let dividend = (sh << bits) | i128::from(vl);
+                let sd = i128::from(sign_extend_u64(vd, bits) as i64);
+                if bits == 64 && dividend == i128::MIN && sd == -1 {
+                    self.cold_trap_branch("true", ColdTrapKind::DivideError, ins.ip());
+                    return Ok(());
+                }
+                let q128 = dividend / sd;
+                let r128 = dividend % sd;
+                let min_q = -(1i128 << (bits - 1));
+                let max_q = (1i128 << (bits - 1)) - 1;
+                if q128 < min_q || q128 > max_q {
+                    self.cold_trap_branch("true", ColdTrapKind::DivideError, ins.ip());
+                    return Ok(());
+                }
+                let q = imm(q128 as u64, bits);
+                let r = imm(r128 as u64, bits);
+                self.write_reg(qreg, &q, bits)?;
+                return self.write_reg(rreg, &r, bits);
+            }
+        }
+
+        // General dynamic divide path (reuses already-loaded `divisor` without re-reading memory).
+        let ext = if signed { "sext" } else { "zext" };
+        if matches!(bits, 32 | 64) {
+            if !signed
+                && self.known.gprs[RDX]
+                    .as_deref()
+                    .and_then(super::memory_access::const_addr)
+                    .is_some_and(|v| (v & mask(bits)) == 0)
+            {
+                let (lo, _) = self.read_reg(qreg)?;
+                let fault = self.val(&format!("icmp eq {t} {divisor}, 0"));
+                self.cold_trap_branch(&fault, ColdTrapKind::DivideError, ins.ip());
+                let q = self.val(&format!("udiv {t} {lo}, {divisor}"));
+                let r = self.val(&format!("urem {t} {lo}, {divisor}"));
+                self.write_reg(qreg, &q, bits)?;
+                return self.write_reg(rreg, &r, bits);
+            }
+            if signed
+                && matches!(
+                    &self.known.sign_ext_rdx,
+                    Some((rdx64, rax64, b))
+                        if *b == bits
+                            && self.known.gprs[RDX].as_deref() == Some(rdx64.as_str())
+                            && self.known.gprs[RAX].as_deref() == Some(rax64.as_str())
+                )
+            {
+                let (lo, _) = self.read_reg(qreg)?;
+                let d_zero = self.val(&format!("icmp eq {t} {divisor}, 0"));
+                let min_val = imm(1u64 << (bits - 1), bits);
+                let is_min = self.val(&format!("icmp eq {t} {lo}, {min_val}"));
+                let is_neg1 = self.val(&format!("icmp eq {t} {divisor}, -1"));
+                let ov = self.val(&format!("and i1 {is_min}, {is_neg1}"));
+                let fault = self.val(&format!("or i1 {d_zero}, {ov}"));
+                self.cold_trap_branch(&fault, ColdTrapKind::DivideError, ins.ip());
+                let q = self.val(&format!("sdiv {t} {lo}, {divisor}"));
+                let r = self.val(&format!("srem {t} {lo}, {divisor}"));
+                self.write_reg(qreg, &q, bits)?;
+                return self.write_reg(rreg, &r, bits);
+            }
+        }
+
+        if bits < 64 {
+            let (dividend, hi_part) = if bits == 8 {
+                let (ax, _) = self.read_reg(Register::AX)?;
+                let div = self.val(&format!("{ext} i16 {ax} to i64"));
+                let hi = (!signed).then(|| self.val(&format!("lshr i64 {div}, 8")));
+                (div, hi)
+            } else {
+                let (h, _) = self.read_reg(rreg)?;
+                let (l, _) = self.read_reg(qreg)?;
+                let h64 = self.val(&format!("zext {t} {h} to i64"));
+                let l64 = self.val(&format!("zext {t} {l} to i64"));
+                let hsh = self.val(&format!("shl i64 {h64}, {bits}"));
+                let joined = self.val(&format!("or i64 {hsh}, {l64}"));
+                let div = if signed && bits == 16 {
+                    let narrow = self.val(&format!("trunc i64 {joined} to i32"));
+                    self.val(&format!("sext i32 {narrow} to i64"))
+                } else {
+                    joined
+                };
+                (div, (!signed).then_some(h64))
+            };
+            let d = self.val(&format!("{ext} {t} {divisor} to i64"));
+            let (q, r) = if !signed {
+                let hi_part = hi_part.expect("unsigned hi_part");
+                let fault = self.val(&format!("icmp uge i64 {hi_part}, {d}"));
+                self.cold_trap_branch(&fault, ColdTrapKind::DivideError, ins.ip());
+                let q64 = self.val(&format!("udiv i64 {dividend}, {d}"));
+                let r64 = self.val(&format!("urem i64 {dividend}, {d}"));
+                (
+                    self.val(&format!("trunc i64 {q64} to {t}")),
+                    self.val(&format!("trunc i64 {r64} to {t}")),
+                )
+            } else {
+                let d_zero = self.val(&format!("icmp eq i64 {d}, 0"));
+                let pre_fault = if bits == 32 {
+                    let is_min =
+                        self.val(&format!("icmp eq i64 {dividend}, -9223372036854775808"));
+                    let is_neg1 = self.val(&format!("icmp eq i64 {d}, -1"));
+                    let sdiv_ov = self.val(&format!("and i1 {is_min}, {is_neg1}"));
+                    self.val(&format!("or i1 {d_zero}, {sdiv_ov}"))
+                } else {
+                    d_zero
+                };
+                self.cold_trap_branch(&pre_fault, ColdTrapKind::DivideError, ins.ip());
+                let q64 = self.val(&format!("sdiv i64 {dividend}, {d}"));
+                let r64 = self.val(&format!("srem i64 {dividend}, {d}"));
+                let qn = self.val(&format!("trunc i64 {q64} to {t}"));
+                let rn = self.val(&format!("trunc i64 {r64} to {t}"));
+                let back = self.val(&format!("sext {t} {qn} to i64"));
+                let range = self.val(&format!("icmp ne i64 {back}, {q64}"));
+                self.cold_trap_branch(&range, ColdTrapKind::DivideError, ins.ip());
+                (qn, rn)
+            };
+            self.write_reg(qreg, &q, bits)?;
+            return self.write_reg(rreg, &r, bits);
+        }
+
+        let (hi, _) = self.read_reg(Register::RDX)?;
+        let (lo, _) = self.read_reg(Register::RAX)?;
+        let helper = if signed {
+            self.support.insert(Support::Sdiv128);
+            "__playgta6_sdiv128"
+        } else {
+            self.support.insert(Support::Udiv128);
+            "__playgta6_udiv128"
+        };
+        let res = self.val(&format!(
+            "call {{ i64, i64, i1 }} @{helper}(i64 {hi}, i64 {lo}, i64 {divisor})"
+        ));
+        let q = self.val(&format!("extractvalue {{ i64, i64, i1 }} {res}, 0"));
+        let r = self.val(&format!("extractvalue {{ i64, i64, i1 }} {res}, 1"));
+        let fault = self.val(&format!("extractvalue {{ i64, i64, i1 }} {res}, 2"));
+        self.cold_trap_branch(&fault, ColdTrapKind::DivideError, ins.ip());
+        self.write_reg(Register::RAX, &q, 64)?;
+        self.write_reg(Register::RDX, &r, 64)
+    }
+
+    /// `neg` with full constant folding (result + all 6 arithmetic flags) and simplified dynamic
+    /// `AF = ((a & 0xF) != 0)` (2 ops instead of `xor` + `and 16` + `icmp ne 0`).
+    fn opt_neg(&mut self, ins: &Instruction) -> R<()> {
+        let bits = self.op_bits(ins, 0)?;
+        let t = ty(bits);
+        let a = self.read_op(ins, 0, bits)?;
+        let min_u = 1u64 << (bits - 1);
+        if let Some(va) = parse_const(&a, bits) {
+            let r_u = 0u64.wrapping_sub(va) & mask(bits);
+            let r_s = imm(r_u, bits);
+            let b_str = |b: bool| if b { "true" } else { "false" };
+            self.set_flag(Flag::Cf, b_str(va != 0));
+            self.set_flag(Flag::Of, b_str(va == min_u));
+            self.set_flag(Flag::Af, b_str((va & 0xF) != 0));
+            self.set_flag(Flag::Zf, b_str(r_u == 0));
+            self.set_flag(Flag::Sf, b_str((r_u & min_u) != 0));
+            self.set_flag(Flag::Pf, b_str(((r_u as u8).count_ones() & 1) == 0));
+            self.known.flag_source = Some(if va == 0 {
+                FlagSource::ConstZero
+            } else {
+                FlagSource::Compare {
+                    a: "0".to_string(),
+                    b: a,
+                    diff: Some(r_s.clone()),
+                    bits,
+                }
+            });
+            return self.write_op(ins, 0, &r_s, bits);
+        }
+        let r = self.val(&format!("sub {t} 0, {a}"));
+        if self.flag_live(Flag::Cf) {
+            let cf = self.val(&format!("icmp ne {t} {a}, 0"));
+            self.set_flag(Flag::Cf, &cf);
+        }
+        if self.flag_live(Flag::Of) {
+            let min = imm(min_u, bits);
+            let of = self.val(&format!("icmp eq {t} {a}, {min}"));
+            self.set_flag(Flag::Of, &of);
+        }
+        if self.flag_live(Flag::Af) {
+            let low = self.val(&format!("and {t} {a}, 15"));
+            let af = self.val(&format!("icmp ne {t} {low}, 0"));
+            self.set_flag(Flag::Af, &af);
+        }
+        self.set_zsp(&r, bits);
+        self.known.flag_source = Some(FlagSource::Compare {
+            a: "0".to_string(),
+            b: a,
+            diff: Some(r.clone()),
+            bits,
+        });
+        self.write_op(ins, 0, &r, bits)
+    }
+
+    /// `cwd`/`cdq`/`cqo`: folds constant and provably non-negative inputs (`sign bit known 0`)
+    /// directly to `0` (or `-1`) without emitting `ashr`, while preserving `known.sign_ext_rdx`.
+    fn opt_sign_extend_dx(&mut self, ins: &Instruction) -> R<()> {
+        let (src, dst) = match ins.mnemonic() {
+            Mnemonic::Cwd => (Register::AX, Register::DX),
+            Mnemonic::Cdq => (Register::EAX, Register::EDX),
+            _ => (Register::RAX, Register::RDX),
+        };
+        let (v, bits) = self.read_reg(src)?;
+        let sign_bit = 1u64 << (bits - 1);
+        let sign = if let Some(c) = parse_const(&v, bits) {
+            if (c & sign_bit) != 0 {
+                "-1".to_string()
+            } else {
+                "0".to_string()
+            }
+        } else if (self.nonzero_bits(&v, bits) & sign_bit) == 0 {
+            "0".to_string()
+        } else {
+            self.val(&format!("ashr i{bits} {v}, {}", bits - 1))
+        };
+        self.write_reg(dst, &sign, bits)?;
+        if matches!(bits, 32 | 64)
+            && let (Some(rdx64), Some(rax64)) = (
+                self.known.gprs[RDX].clone(),
+                self.known.gprs[RAX].clone(),
+            )
+        {
+            self.known.sign_ext_rdx = Some((rdx64, rax64, bits));
+        }
+        Ok(())
+    }
+
+    /// `cbw`/`cwde`/`cdqe`: folds constants and elides `trunc`/`sext` when the sign bit is
+    /// provably zero (e.g. `movzx eax, word ptr [rcx]; cdqe` becomes a pure no-op).
+    fn opt_sign_extend_ax(&mut self, ins: &Instruction) -> R<()> {
+        let (src, dst, dst_bits) = match ins.mnemonic() {
+            Mnemonic::Cbw => (Register::AL, Register::AX, 16),
+            Mnemonic::Cwde => (Register::AX, Register::EAX, 32),
+            _ => (Register::EAX, Register::RAX, 64),
+        };
+        if ins.mnemonic() == Mnemonic::Cdqe {
+            let full = self.load_gpr(RAX)?;
+            if let Some(c) = parse_const(&full, 64) {
+                return self.store_gpr(RAX, &imm(sign_extend_u64(c & mask(32), 32), 64));
+            }
+            let nz = self.nonzero_bits(&full, 64);
+            if (nz & !0x7FFF_FFFF) == 0 {
+                // Already zero-extended and bit 31 == 0: `cdqe` is an architectural no-op!
+                return Ok(());
+            }
+            if (nz & 0x8000_0000) == 0 {
+                // Bit 31 == 0, upper 32 may be dirty: mask to 32 bits instead of `trunc` + `sext`.
+                let wide = self.val(&format!("and i64 {full}, 4294967295"));
+                return self.store_gpr(RAX, &wide);
+            }
+        }
+        let (v, src_bits) = self.read_reg(src)?;
+        let sign_bit = 1u64 << (src_bits - 1);
+        let ext = if let Some(c) = parse_const(&v, src_bits) {
+            imm(sign_extend_u64(c, src_bits), dst_bits)
+        } else if (self.nonzero_bits(&v, src_bits) & sign_bit) == 0 {
+            self.val(&format!("zext i{src_bits} {v} to i{dst_bits}"))
+        } else {
+            self.val(&format!("sext i{src_bits} {v} to i{dst_bits}"))
+        };
+        self.write_reg(dst, &ext, dst_bits)
+    }
+
+    /// `movzx`/`movsx`/`movsxd` with constant folding, direct 64-bit masking for high-byte
+    /// `movzx r32/r64, r8h`, and zero-cost `sext` elision when the source sign bit is known zero.
+    fn opt_mov_extend(&mut self, ins: &Instruction) -> R<()> {
+        let dst_bits = self.op_bits(ins, 0)?;
+        let src_bits = self.op_bits(ins, 1)?;
+        if src_bits > dst_bits {
+            return unsupported("narrowing extension");
+        }
+        let is_zx = ins.mnemonic() == Mnemonic::Movzx;
+
+        if ins.op_kind(0) == OpKind::Register && matches!(dst_bits, 32 | 64) {
+            let RegRef::Low(dst_idx, _) = reg_ref(ins.op_register(0))? else {
+                return unsupported("mov extend destination");
+            };
+            if is_zx && src_bits < 32 {
+                let wide = if ins.op_kind(1) == OpKind::Register {
+                    match reg_ref(ins.op_register(1))? {
+                        RegRef::Low(src_idx, sb) if sb == src_bits => {
+                            let full = self.load_gpr(src_idx)?;
+                            self.val(&format!("and i64 {full}, {}", mask(src_bits)))
+                        }
+                        RegRef::High8(src_idx) if src_bits == 8 => {
+                            let full = self.load_gpr(src_idx)?;
+                            if let Some(c) = parse_const(&full, 64) {
+                                imm((c >> 8) & 0xFF, 64)
+                            } else {
+                                let shifted = self.val(&format!("lshr i64 {full}, 8"));
+                                self.val(&format!("and i64 {shifted}, 255"))
+                            }
+                        }
+                        _ => {
+                            let v = self.read_op(ins, 1, src_bits)?;
+                            self.val(&format!("zext i{src_bits} {v} to i64"))
+                        }
+                    }
+                } else {
+                    let v = self.read_op(ins, 1, src_bits)?;
+                    self.val(&format!("zext i{src_bits} {v} to i64"))
+                };
+                return self.store_gpr(dst_idx, &wide);
+            }
+            if !is_zx && ins.op_kind(1) == OpKind::Register {
+                match reg_ref(ins.op_register(1))? {
+                    RegRef::Low(src_idx, sb) if sb == src_bits => {
+                        let full = self.load_gpr(src_idx)?;
+                        if let Some(c) = parse_const(&full, 64) {
+                            let ext = sign_extend_u64(c & mask(src_bits), src_bits);
+                            let final_v = if dst_bits == 32 { ext & mask(32) } else { ext };
+                            return self.store_gpr(dst_idx, &imm(final_v, 64));
+                        }
+                        let sign_bit = 1u64 << (src_bits - 1);
+                        let nz = self.nonzero_bits(&full, 64);
+                        if (nz & sign_bit) == 0 {
+                            // Sign bit of source is provably 0: `movsx`/`movsxd` is identical to
+                            // zero-extension, avoiding `trunc` + `sext` (+ `zext` for 32-bit)!
+                            let wide = self.val(&format!("and i64 {full}, {}", mask(src_bits)));
+                            return self.store_gpr(dst_idx, &wide);
+                        }
+                    }
+                    RegRef::High8(src_idx) if src_bits == 8 => {
+                        let full = self.load_gpr(src_idx)?;
+                        if let Some(c) = parse_const(&full, 64) {
+                            let ext = sign_extend_u64((c >> 8) & 0xFF, 8);
+                            let final_v = if dst_bits == 32 { ext & mask(32) } else { ext };
+                            return self.store_gpr(dst_idx, &imm(final_v, 64));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let v = self.read_op(ins, 1, src_bits)?;
+        let out = if src_bits == dst_bits {
+            v
+        } else if let Some(c) = parse_const(&v, src_bits) {
+            let ext = if is_zx { c } else { sign_extend_u64(c, src_bits) };
+            imm(ext, dst_bits)
+        } else {
+            let sign_bit = 1u64 << (src_bits - 1);
+            let ext = if is_zx || (self.nonzero_bits(&v, src_bits) & sign_bit) == 0 {
+                "zext"
+            } else {
+                "sext"
+            };
+            self.val(&format!("{ext} i{src_bits} {v} to i{dst_bits}"))
+        };
+        self.write_op(ins, 0, &out, dst_bits)
     }
 }
