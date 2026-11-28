@@ -1411,37 +1411,51 @@ bool resolve_stage_bindings(const d3d::RootSignatureDesc& rs, bool compute, cons
                 }
                 const bool sampler_kind =
                     b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
-                if (sampler_kind != is_sampler_heap) {
-                    *had_uncovered_user_sgpr = true;
-                    fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot come from the implicit " +
-                                (is_sampler_heap ? "sampler" : "resource") + " heap at s" +
-                                std::to_string(b.user_sgpr));
-                    continue;
+                if (is_sampler_heap && b.kind == ReflectedBindingKind::Uniform &&
+                    b.source == ReflectedSource::RootDescriptor) {
+                    // The stage reads raw dwords of the sampler heap (s_load of S# words through the
+                    // SamplerDescriptorHeap pointer, e.g. to pick a sampler by a branch), which the
+                    // translator declares as a uniform buffer over that SGPR. Our heap holds no console
+                    // S# words to expose, and the samplers the stage samples with join on their own; bind
+                    // the worker's default buffer (an unresolved register, as for #482) so the pipeline
+                    // still joins instead of skipping every draw (mesh scene passes, #2214).
+                    cls = d3d::DescriptorRangeType::Cbv;
+                    reg = space = d3d::kNoIndex;
+                    is_unresolved = true;
+                } else {
+                    if (sampler_kind != is_sampler_heap) {
+                        *had_uncovered_user_sgpr = true;
+                        fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot come from the implicit " +
+                                    (is_sampler_heap ? "sampler" : "resource") + " heap at s" +
+                                    std::to_string(b.user_sgpr));
+                        continue;
+                    }
+                    const uint32_t table_byte_offset =
+                        (b.source == ReflectedSource::RootDescriptor && !b.root_table_offset_given)
+                            ? 0u
+                            : b.table_byte_offset;
+                    const uint32_t slot_bytes = is_sampler_heap ? bridge::kSamplerSlotBytes : kTableSlotBytes;
+                    if (table_byte_offset % slot_bytes != 0) {
+                        *had_uncovered_user_sgpr = true;
+                        fail(b, std::string("implicit ") + (is_sampler_heap ? "sampler" : "resource") + " heap at s" +
+                                    std::to_string(b.user_sgpr) + ": byte offset " + std::to_string(table_byte_offset) +
+                                    " is not a descriptor boundary");
+                        continue;
+                    }
+                    const uint32_t slot_index = table_byte_offset / slot_bytes;
+                    cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
+                          : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
+                          : (b.kind == ReflectedBindingKind::Storage || b.kind == ReflectedBindingKind::StorageTexture)
+                              ? d3d::DescriptorRangeType::Uav
+                              : d3d::DescriptorRangeType::Srv;
+                    reg = space = 0;
+                    lb.join.heap = is_sampler_heap ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
+                    lb.join.heap_index_source = d3d::HeapIndexSource::Constant;
+                    lb.join.heap_index_parameter = d3d::kNoIndex;
+                    lb.join.heap_index_dword = slot_index;
+                    lb.join.heap_shift = is_sampler_heap ? 4u : 5u;
+                    is_implicit_heap = true;
                 }
-                const uint32_t table_byte_offset =
-                    (b.source == ReflectedSource::RootDescriptor && !b.root_table_offset_given) ? 0u
-                                                                                                : b.table_byte_offset;
-                const uint32_t slot_bytes = is_sampler_heap ? bridge::kSamplerSlotBytes : kTableSlotBytes;
-                if (table_byte_offset % slot_bytes != 0) {
-                    *had_uncovered_user_sgpr = true;
-                    fail(b, std::string("implicit ") + (is_sampler_heap ? "sampler" : "resource") + " heap at s" +
-                                std::to_string(b.user_sgpr) + ": byte offset " + std::to_string(table_byte_offset) +
-                                " is not a descriptor boundary");
-                    continue;
-                }
-                const uint32_t slot_index = table_byte_offset / slot_bytes;
-                cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
-                      : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
-                      : (b.kind == ReflectedBindingKind::Storage || b.kind == ReflectedBindingKind::StorageTexture)
-                          ? d3d::DescriptorRangeType::Uav
-                          : d3d::DescriptorRangeType::Srv;
-                reg = space = 0;
-                lb.join.heap = is_sampler_heap ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
-                lb.join.heap_index_source = d3d::HeapIndexSource::Constant;
-                lb.join.heap_index_parameter = d3d::kNoIndex;
-                lb.join.heap_index_dword = slot_index;
-                lb.join.heap_shift = is_sampler_heap ? 4u : 5u;
-                is_implicit_heap = true;
             } else {
             if (into != 0 && (b.source == ReflectedSource::Table || b.source == ReflectedSource::RootDescriptor) &&
                 rs.parameters[static_cast<size_t>(pi)].parameter_type != d3d::RootParameterType::DescriptorTable) {

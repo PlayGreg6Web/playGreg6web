@@ -2998,6 +2998,39 @@ void test_sm66_implicit_heap_sgprs() {
         CHECK(report.empty() && mesh_stats.shifted_user_data_base_stages == 0 &&
               mesh_stats.implicit_heap_bindings == 2);
 
+        // #2214: a mesh stage that also reads raw S# words through s_smp (the translator's uniform
+        // "root descriptor" over the sampler heap pointer, e.g. mesh 0x43a369bef212cc54) joins: the
+        // uniform binds the worker's default buffer (unresolved), the samplers still join from the
+        // heap. A texture or storage buffer over s_smp still fails.
+        ReflectedBinding m_raw;
+        m_raw.group = 0;
+        m_raw.binding = 12;
+        m_raw.kind = ReflectedBindingKind::Uniform;
+        m_raw.source = ReflectedSource::RootDescriptor;
+        m_raw.user_sgpr = 21;
+        m_raw.min_binding_size = 1088;
+        mesh.bindings = {m_res, m_smp, m_raw};
+        report.clear();
+        JoinStats raw_stats;
+        bridge::PipelineLayoutDesc raw_layout;
+        CHECK(join_pipeline_layout(rs_gfx, false, {{GpuShaderStageBits::Compute, &mesh}}, &raw_layout, &report,
+                                   &raw_stats, JoinOptions{false, kMeshUserDataBase}));
+        CHECK(report.empty() && raw_stats.unresolved_bindings == 1 && raw_stats.implicit_heap_bindings == 2);
+        const bridge::LayoutBinding* raw = find(raw_layout, 0, 12);
+        CHECK(raw != nullptr && raw->join.heap == d3d::HeapAccess::None &&
+              raw->join.register_class == d3d::DescriptorRangeType::Cbv &&
+              raw->join.shader_register == d3d::kNoIndex && raw->entry.min_binding_size == 1088);
+        const bridge::LayoutBinding* raw_smp = find(raw_layout, 0, 2);
+        CHECK(raw_smp != nullptr && raw_smp->join.heap == d3d::HeapAccess::Sampler &&
+              raw_smp->join.heap_index_dword == 3);
+        ReflectedBinding m_raw_storage = m_raw;
+        m_raw_storage.kind = ReflectedBindingKind::ReadOnlyStorage;
+        mesh.bindings = {m_res, m_smp, m_raw_storage};
+        report.clear();
+        CHECK(!join_pipeline_layout(rs_gfx, false, {{GpuShaderStageBits::Compute, &mesh}}, &raw_layout, &report,
+                                    nullptr, JoinOptions{false, kMeshUserDataBase}));
+        CHECK(report.find("cannot come from the implicit sampler heap at s21") != std::string::npos);
+
         // Pure 0-parameter SM 6.6 bindless RS (parameters empty, flags=0xc00):
         // compute uses s_res=s4, s_smp=s5; shifted VS uses s_res=s16, s_smp=s17.
         d3d::RootSignatureDesc rs_empty;
