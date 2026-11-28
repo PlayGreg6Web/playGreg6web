@@ -236,6 +236,8 @@ struct ExecutorStats {
     uint64_t recovery_attempts = 0;           // device creations tried by recoveries
     uint64_t recovery_instance_resets = 0;    // ... after dropping the instance (the removed adapter's D3D12 device)
     uint64_t recovery_bind_groups_deferred = 0;  // bind groups a recovery left to their next bind (not replayed)
+    uint64_t recovery_adapter_mismatches = 0;    // recovery attempts that were offered another adapter (e.g. WARP)
+    uint64_t recovery_shader_jobs_dropped = 0;   // queued shader-worker jobs of the lost device dropped by a recovery
     std::string recovery_timeline;            // JSON: the last recovery's phases and attempts (ms)
     uint64_t debug_gpu_hangs = 0;             // GPU hangs injected on purpose (debug_hang_gpu / PG6_DEBUG_GPU_HANG_AT_FRAME)
     uint64_t submit_budget_splits = 0;        // early submits at a pass boundary (submit_budget_ns)

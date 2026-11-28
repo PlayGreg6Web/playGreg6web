@@ -39,6 +39,7 @@
 #include "gpu/drop_table.h"
 #include "gpu/gpu_time.h"
 #include "gpu/present_pacing.h"
+#include "gpu/native_exec/adapter_model.h"
 #include "gpu/native_exec/binding_access_model.h"
 #include "gpu/native_exec/blit_model.h"
 #include "gpu/native_exec/window_script.h"
@@ -718,6 +719,7 @@ struct NativeExecutor::Impl {
     wgpu::Instance instance;
     std::unique_ptr<dawn::native::Instance> native_instance;  // --adapter warp: enumerates the CPU adapter
     wgpu::Adapter adapter_handle;
+    std::optional<AdapterIdentity> run_adapter;  // the first device's adapter: the only one a recovery accepts
     wgpu::Device device;
     wgpu::Queue queue;
     AdapterDescription adapter;
@@ -1284,6 +1286,20 @@ struct NativeExecutor::Impl {
         adapter.architecture = to_string(info.architecture);
         adapter.device = to_string(info.device);
         adapter.description = to_string(info.description);
+        AdapterIdentity identity{adapter.backend, info.vendorID, info.deviceID, info.adapterType == wgpu::AdapterType::CPU,
+                                 adapter.description};
+        if (!run_adapter) {
+            run_adapter = identity;
+        } else if (!same_adapter(*run_adapter, identity)) {
+            // adapter_model.h: the run's adapter is not open yet (the lost device still lives, or the driver
+            // is still resetting it); a device on another one (WARP) would run the title in software.
+            ++stats.recovery_adapter_mismatches;
+            adapter_handle = nullptr;
+            *status = CreateStatus::NoAdapter;
+            *error = "the instance offered another adapter (" + identity.description + (identity.cpu ? ", CPU" : "") +
+                     ") than the run's (" + run_adapter->description + ")";
+            return false;
+        }
 
         // The features tools/replay/replay.html requests (those the adapter has), default limits:
         // the replay page is the reference the executor is compared against.
@@ -3001,6 +3017,9 @@ struct NativeExecutor::Impl {
     // Drops every object of the lost device (the executor's own state; the journal stays).
     void release_device_objects() {
         const uint64_t t0 = now_ns();
+        // Queued shader-worker jobs each hold the lost device (adapter_model.h): dropped, running ones waited
+        // for. Their entries go with `shaders` below; the new device materializes what it needs again.
+        if (shader_workers.running()) stats.recovery_shader_jobs_dropped += shader_workers.cancel_pending();
         pass_cmds.clear();
         recorded_readbacks.clear();
         readback_flush_wanted = false;
@@ -3090,6 +3109,9 @@ struct NativeExecutor::Impl {
         snap_free.clear();
         unref_dummy_w.clear();
         unref_dummy_r.clear();
+        min_twins_render.clear();
+        min_twins_compute.clear();
+        att_proxies.clear();
         for (auto& p : show_pipe) p = nullptr;
         for (auto& b : show_bgl) b = nullptr;
         show_ub = nullptr;
@@ -3261,10 +3283,10 @@ struct NativeExecutor::Impl {
             }
             std::fprintf(stderr,
                          "[native_exec] recovery attempt %d: release %llu ms (objects %llu, unconfigure %llu, destroy %llu, "
-                         "drop %llu, events %llu), backoff %llu ms, instance %llu ms, device %llu ms: %s\n",
+                         "drop %llu, events %llu), backoff %llu ms, instance %llu ms, device %llu ms: %s%s\n",
                          attempt + 1, release_ms, ms_of(release_ns[0]), ms_of(release_ns[1]), ms_of(release_ns[2]),
                          ms_of(release_ns[3]), ms_of(release_ns[4]), backoff_ms, instance_ms, device_ms,
-                         acquired ? "ok" : last_error.c_str());
+                         acquired ? "ok on " : last_error.c_str(), acquired ? adapter.description.c_str() : "");
             if (acquired && !features_equal(before, features)) return fail_fatal("the new device lacks features the old one had");
             if (acquired) {
                 const uint64_t errors_before = stats.packet_errors;
@@ -11629,6 +11651,8 @@ std::string NativeExecutor::stats_json() const {
     num("recovery_attempts", st.recovery_attempts);
     num("recovery_instance_resets", st.recovery_instance_resets);
     num("recovery_bind_groups_deferred", st.recovery_bind_groups_deferred);
+    num("recovery_adapter_mismatches", st.recovery_adapter_mismatches);
+    num("recovery_shader_jobs_dropped", st.recovery_shader_jobs_dropped);
     num("debug_gpu_hangs", st.debug_gpu_hangs);
     num("gpu_stall_events", impl_->gpu_stall_events.load());
     num("gpu_stall_removals", impl_->gpu_stall_removals.load());
