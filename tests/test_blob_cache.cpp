@@ -2,9 +2,12 @@
 // Store/load round trip, persistence across reopen, damaged files, LRU eviction under the cap,
 // per-title/version directory split. No GPU, no Dawn.
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -207,6 +210,54 @@ void test_threads(const fs::path& root) {
     for (auto& t : ts) t.join();
     CHECK(c.stats().stores == 160 && c.stats().hits == 160 && c.stats().entries == 160);
 }
+// A load / store stalled in its file I/O (a starved disk) does not hold the mutex: other loads,
+// stores and stats() go through meanwhile (they used to queue behind it, which serialised every
+// Dawn module and pipeline creation on one slow read).
+void test_io_outside_lock(const fs::path& root) {
+    BlobCache c;
+    CHECK(c.open((root / "io").string(), 1 << 22));
+    put(c, 1, bytes(300, 1));
+    std::mutex m;
+    std::condition_variable cv;
+    bool stalled = false, release = false;
+    const std::thread::id staller_id = std::this_thread::get_id();
+    std::thread::id stall_thread;
+    c.set_io_hook_for_testing([&] {
+        std::unique_lock<std::mutex> lock(m);
+        if (stalled) return;  // only the first I/O stalls
+        stalled = true;
+        stall_thread = std::this_thread::get_id();
+        cv.notify_all();
+        cv.wait_for(lock, std::chrono::seconds(10), [&] { return release; });
+    });
+    std::thread slow([&] {
+        std::vector<uint8_t> got;
+        CHECK(get(c, 1, &got) && got == bytes(300, 1));
+    });
+    {
+        std::unique_lock<std::mutex> lock(m);
+        CHECK(cv.wait_for(lock, std::chrono::seconds(10), [&] { return stalled; }));
+    }
+    CHECK(stall_thread != staller_id);
+    // While the first load sits in its I/O: another thread stores and loads, and stats() answers.
+    auto other = std::async(std::launch::async, [&] {
+        put(c, 2, bytes(500, 2));
+        std::vector<uint8_t> got;
+        return get(c, 2, &got) && got == bytes(500, 2) && c.stats().stores == 2;
+    });
+    CHECK(other.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    {
+        std::lock_guard<std::mutex> lock(m);
+        release = true;
+    }
+    cv.notify_all();
+    slow.join();
+    CHECK(other.get());
+    c.set_io_hook_for_testing(nullptr);
+    const BlobCacheStats s = c.stats();
+    CHECK(s.hits == 2 && s.entries == 2);
+    CHECK(s.io_max_ns > 0 && s.io_slow == 0);
+}
 }  // namespace
 
 int main() {
@@ -220,6 +271,7 @@ int main() {
     test_recency_survives_reopen(root);
     test_disabled_and_dirs(root);
     test_threads(root);
+    test_io_outside_lock(root);
     std::error_code ec;
     fs::remove_all(root, ec);
     if (g_failures == 0) std::puts("test_blob_cache: all passed");

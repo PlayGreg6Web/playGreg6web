@@ -294,6 +294,9 @@ struct ExecutorStats {
     uint64_t shader_async_max_hash = 0;
     uint64_t shader_async_max_bytes = 0;
     uint64_t shader_async_private_mb_max = 0;
+    uint64_t shader_async_max_cpu_ns = 0;    // CPU time of the slowest one (far below its wall time: it waited)
+    uint64_t shader_async_slow = 0;          // modules that took >= 1 s
+    uint64_t shader_async_slow_blocked = 0;  // ... of them mostly off the CPU (disk, paging or a lock)
     uint64_t shader_async_waits = 0;
     uint64_t shader_async_wait_ns = 0;
     // Pipelines created after their packet because a shader was still on a worker: deferred, built
@@ -470,6 +473,8 @@ struct ExecutorStats {
     uint64_t blob_bytes_stored = 0;
     uint64_t blob_evictions = 0;  // LRU removals to stay under the cap
     uint64_t blob_corrupt = 0;
+    uint64_t blob_io_max_ns = 0;  // slowest single cache file read / write
+    uint64_t blob_io_slow = 0;    // cache file reads / writes that took over 1 s
     uint64_t blob_entries = 0;
     uint64_t blob_total_bytes = 0;
     uint64_t blob_max_bytes = 0;

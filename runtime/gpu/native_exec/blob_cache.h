@@ -10,7 +10,7 @@
 // file time, so recency survives restarts) are removed until the total fits.
 //
 // Header-only, no Dawn dependency (unit-tested without a GPU). Thread-safe: Dawn calls the hooks
-// from its worker threads. Holds no game bytes beyond what Dawn derives from the shaders the title
+// from its worker threads; the mutex guards the index only, never a file read or write. Holds no game bytes beyond what Dawn derives from the shaders the title
 // creates, in the user's cache directory, never in a checkout.
 #pragma once
 
@@ -23,6 +23,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <system_error>
@@ -46,6 +47,8 @@ struct BlobCacheStats {
     uint64_t entries = 0;
     uint64_t total_bytes = 0;    // blob bytes on disk (file sizes)
     uint64_t max_bytes = 0;
+    uint64_t io_max_ns = 0;      // slowest single load / store file operation
+    uint64_t io_slow = 0;        // load / store file operations that took over 1 s (a starved disk)
 };
 
 class BlobCache {
@@ -128,7 +131,9 @@ public:
             total_ += f.size;
         }
         enabled_ = true;
-        evict_locked(std::string());
+        std::vector<fs::path> victims;
+        evict_locked(std::string(), &victims);
+        for (const fs::path& v : victims) fs::remove(v, ec);
         return true;
     }
 
@@ -155,66 +160,104 @@ public:
 
     // Dawn's load hook. value == nullptr or value_size == 0 asks for the stored size only (0 = none,
     // not counted); otherwise copies the blob and returns its size (0 when it does not fit / is gone).
+    // The file is read without the mutex: Dawn calls this from the shader workers, its pipeline
+    // threads and the executor at once, and one read stalled on a busy disk must not hold up all the
+    // others behind it.
     size_t load(const void* key, size_t key_size, void* value, size_t value_size) {
         namespace fs = std::filesystem;
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!enabled_ || key == nullptr || key_size == 0) return 0;
-        const bool probe = value == nullptr || value_size == 0;
+        if (key == nullptr || key_size == 0) return 0;
         const std::string name = file_name(key, key_size);
-        auto it = index_.find(name);
-        if (it == index_.end()) {
-            ++misses_;
-            return 0;
+        fs::path path;
+        uint64_t gen = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!enabled_) return 0;
+            auto it = index_.find(name);
+            if (it == index_.end()) {
+                ++misses_;
+                return 0;
+            }
+            path = fs::path(dir_) / name;
+            gen = it->second.gen;
         }
-        const fs::path path = fs::path(dir_) / name;
-        std::ifstream in(path, std::ios::binary);
+        const bool probe = value == nullptr || value_size == 0;
+        const uint64_t t0 = io_now_ns();
+        io_hook();
         Header h{};
-        std::vector<uint8_t> stored_key;
-        bool ok = false;
-        if (in && in.read(reinterpret_cast<char*>(&h), sizeof h) && h.magic == kMagic && h.version == kVersion &&
-            h.key_size == key_size) {
-            stored_key.resize(key_size);
-            ok = in.read(reinterpret_cast<char*>(stored_key.data()), static_cast<std::streamsize>(key_size)).good() &&
-                 std::memcmp(stored_key.data(), key, key_size) == 0;
+        bool ok = false, damaged = false, fits = true;
+        {
+            std::ifstream in(path, std::ios::binary);
+            if (in && in.read(reinterpret_cast<char*>(&h), sizeof h) && h.magic == kMagic && h.version == kVersion &&
+                h.key_size == key_size) {
+                std::vector<uint8_t> stored_key(key_size);
+                ok = in.read(reinterpret_cast<char*>(stored_key.data()), static_cast<std::streamsize>(key_size)).good() &&
+                     std::memcmp(stored_key.data(), key, key_size) == 0;
+            } else {
+                damaged = true;  // a hash collision between two keys (key mismatch) is a plain miss
+            }
+            if (ok && !probe) {
+                if (value_size < h.value_size) {
+                    fits = false;
+                } else {
+                    in.read(static_cast<char*>(value), static_cast<std::streamsize>(h.value_size));
+                    if (!in || fnv1a(value, static_cast<size_t>(h.value_size)) != h.value_hash) {
+                        ok = false;
+                        damaged = true;
+                    }
+                }
+            }
         }
-        if (!ok) {
-            // Not our blob (a hash collision between two keys is a plain miss) or a damaged file.
-            const bool damaged = !(in && h.magic == kMagic && h.version == kVersion && h.key_size == key_size);
-            in.close();
-            if (damaged) drop_locked(it, true);
-            ++misses_;
-            return 0;
+        const bool hit = ok && fits && !probe;
+        if (hit) {
+            std::error_code ec;
+            fs::last_write_time(path, fs::file_time_type::clock::now(), ec);  // recency survives a restart
         }
-        if (probe) {
-            it->second.seq = ++seq_;
-            return static_cast<size_t>(h.value_size);
+        const uint64_t dt = io_now_ns() - t0;
+        bool remove_file = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            note_io_locked(dt);
+            auto it = index_.find(name);
+            const bool same = it != index_.end() && it->second.gen == gen;  // not replaced or dropped meanwhile
+            if (!ok) {
+                if (damaged && same) {
+                    forget_locked(it, true);
+                    remove_file = true;
+                }
+                ++misses_;
+                return 0;
+            }
+            if (!fits) return 0;
+            if (same) it->second.seq = ++seq_;
+            if (hit) {
+                ++hits_;
+                bytes_loaded_ += h.value_size;
+            }
         }
-        if (value_size < h.value_size) return 0;
-        in.read(static_cast<char*>(value), static_cast<std::streamsize>(h.value_size));
-        if (!in || fnv1a(value, static_cast<size_t>(h.value_size)) != h.value_hash) {
-            in.close();
-            drop_locked(it, true);
-            ++misses_;
-            return 0;
+        if (remove_file) {
+            std::error_code ec;
+            fs::remove(path, ec);
         }
-        in.close();
-        it->second.seq = ++seq_;
-        std::error_code ec;
-        fs::last_write_time(path, fs::file_time_type::clock::now(), ec);  // recency survives a restart
-        ++hits_;
-        bytes_loaded_ += h.value_size;
         return static_cast<size_t>(h.value_size);
     }
 
-    // Dawn's store hook. Replaces an existing blob of the same key.
+    // Dawn's store hook. Replaces an existing blob of the same key. Written through a uniquely named
+    // temporary file and a rename, without the mutex (see load()).
     void store(const void* key, size_t key_size, const void* value, size_t value_size) {
         namespace fs = std::filesystem;
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!enabled_ || key == nullptr || key_size == 0 || value == nullptr || value_size == 0) return;
+        if (key == nullptr || key_size == 0 || value == nullptr || value_size == 0) return;
         const uint64_t file_size = sizeof(Header) + key_size + value_size;
-        if (max_bytes_ != 0 && file_size > max_bytes_) {
-            ++store_rejected_;
-            return;
+        const std::string name = file_name(key, key_size);
+        fs::path path, tmp;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!enabled_) return;
+            if (max_bytes_ != 0 && file_size > max_bytes_) {
+                ++store_rejected_;
+                return;
+            }
+            path = fs::path(dir_) / name;
+            tmp = fs::path(dir_) / (name + ".tmp" + std::to_string(++tmp_counter_));
         }
         Header h{};
         h.magic = kMagic;
@@ -222,35 +265,45 @@ public:
         h.key_size = static_cast<uint32_t>(key_size);
         h.value_size = value_size;
         h.value_hash = fnv1a(value, value_size);
-        const std::string name = file_name(key, key_size);
-        const fs::path path = fs::path(dir_) / name;
-        const fs::path tmp = fs::path(dir_) / (name + ".tmp" + std::to_string(++tmp_counter_));
+        const uint64_t t0 = io_now_ns();
+        io_hook();
+        bool written = false;
         {
             std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-            if (!out || !out.write(reinterpret_cast<const char*>(&h), sizeof h) ||
-                !out.write(static_cast<const char*>(key), static_cast<std::streamsize>(key_size)) ||
-                !out.write(static_cast<const char*>(value), static_cast<std::streamsize>(value_size))) {
-                out.close();
-                std::error_code ec;
-                fs::remove(tmp, ec);
+            written = out && out.write(reinterpret_cast<const char*>(&h), sizeof h) &&
+                      out.write(static_cast<const char*>(key), static_cast<std::streamsize>(key_size)) &&
+                      out.write(static_cast<const char*>(value), static_cast<std::streamsize>(value_size));
+        }
+        std::error_code ec;
+        if (written) {
+            fs::rename(tmp, path, ec);
+            written = !ec;
+        }
+        if (!written) fs::remove(tmp, ec);
+        const uint64_t dt = io_now_ns() - t0;
+        std::vector<fs::path> victims;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            note_io_locked(dt);
+            if (!written) {
                 ++store_rejected_;
                 return;
             }
+            auto it = index_.find(name);
+            if (it != index_.end()) total_ -= it->second.size;
+            index_[name] = {file_size, ++seq_, ++gen_};
+            total_ += file_size;
+            ++stores_;
+            bytes_stored_ += value_size;
+            evict_locked(name, &victims);
         }
-        std::error_code ec;
-        fs::rename(tmp, path, ec);
-        if (ec) {
-            fs::remove(tmp, ec);
-            ++store_rejected_;
-            return;
-        }
-        auto it = index_.find(name);
-        if (it != index_.end()) total_ -= it->second.size;
-        index_[name] = {file_size, ++seq_};
-        total_ += file_size;
-        ++stores_;
-        bytes_stored_ += value_size;
-        evict_locked(name);
+        for (const fs::path& v : victims) fs::remove(v, ec);
+    }
+
+    // Tests only: runs on every load / store right where its file I/O starts (no lock held).
+    void set_io_hook_for_testing(std::function<void()> hook) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        io_hook_ = std::move(hook);
     }
 
     BlobCacheStats stats() const {
@@ -270,6 +323,8 @@ public:
         s.entries = index_.size();
         s.total_bytes = total_;
         s.max_bytes = max_bytes_;
+        s.io_max_ns = io_max_ns_;
+        s.io_slow = io_slow_;
         return s;
     }
 
@@ -287,6 +342,7 @@ private:
     struct Entry {
         uint64_t size = 0;
         uint64_t seq = 0;  // last use; larger = more recent
+        uint64_t gen = 0;  // the store that wrote the file (0: found by open())
     };
     using Index = std::unordered_map<std::string, Entry>;
 
@@ -297,16 +353,36 @@ private:
         return buf;
     }
 
-    void drop_locked(Index::iterator it, bool corrupt) {
-        std::error_code ec;
-        std::filesystem::remove(std::filesystem::path(dir_) / it->first, ec);
+    // Drops the entry from the index; the caller deletes its file after releasing the mutex.
+    void forget_locked(Index::iterator it, bool corrupt) {
         total_ -= it->second.size;
         index_.erase(it);
         if (corrupt) ++corrupt_;
     }
 
-    // Removes least recently used blobs until the total fits; `keep` (the blob just stored) stays.
-    void evict_locked(const std::string& keep) {
+    void note_io_locked(uint64_t ns) {
+        io_max_ns_ = std::max(io_max_ns_, ns);
+        if (ns >= 1000000000ull) ++io_slow_;
+    }
+
+    void io_hook() {
+        std::function<void()> h;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            h = io_hook_;
+        }
+        if (h) h();
+    }
+
+    static uint64_t io_now_ns() {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    }
+
+    // Drops least recently used blobs from the index until the total fits; `keep` (the blob just
+    // stored) stays. Their files go to `victims_out` for the caller to delete without the mutex.
+    void evict_locked(const std::string& keep, std::vector<std::filesystem::path>* victims_out) {
         if (max_bytes_ == 0 || total_ <= max_bytes_) return;
         std::vector<Index::iterator> order;
         order.reserve(index_.size());
@@ -331,7 +407,8 @@ private:
             auto it = index_.find(v);
             ++evictions_;
             evicted_bytes_ += it->second.size;
-            drop_locked(it, false);
+            forget_locked(it, false);
+            victims_out->push_back(std::filesystem::path(dir_) / v);
         }
     }
 
@@ -345,6 +422,8 @@ private:
     Index index_;
     uint64_t hits_ = 0, misses_ = 0, stores_ = 0, store_rejected_ = 0, bytes_loaded_ = 0, bytes_stored_ = 0;
     uint64_t evictions_ = 0, evicted_bytes_ = 0, corrupt_ = 0;
+    uint64_t gen_ = 0, io_max_ns_ = 0, io_slow_ = 0;
+    std::function<void()> io_hook_;
 };
 
 }  // namespace playgta6::gpu::native_exec

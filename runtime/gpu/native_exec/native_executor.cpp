@@ -59,6 +59,7 @@
 #include "gpu/native_exec/stream_model.h"
 #include "gpu/native_exec/usage_scope_model.h"
 #include "os/process_memory.h"
+#include "os/thread_name.h"
 
 namespace playgta6::gpu::native_exec {
 
@@ -424,6 +425,7 @@ struct ShaderEntry {
     mutable bool accounted = false;  // the worker's timings were folded into the executor stats
     mutable std::atomic<bool> ready{false};
     mutable uint64_t worker_ns = 0;       // module compile on the worker
+    mutable uint64_t worker_cpu_ns = 0;   // that compile's CPU time on the worker thread (wall - cpu = blocked)
     mutable uint64_t worker_scan_ns = 0;  // text scans on the worker
     mutable uint32_t worker_scans = 0;
     mutable bool worker_miss = false;     // the pack no longer delivered it (compiled as the hash text)
@@ -4580,6 +4582,7 @@ struct NativeExecutor::Impl {
         const char* stage_name = stage_name_of(e.stage);
         e.explicit_ep = extract_wgsl_entry_point(e.code, stage_name);
         const uint64_t t0 = now_ns();
+        const uint64_t c0 = os::this_thread_cpu_ns();
         wgpu::ShaderSourceWGSL wgsl{};
         wgsl.code = {e.code.data(), e.code.size()};
         wgpu::ShaderModuleDescriptor desc{};
@@ -4587,6 +4590,8 @@ struct NativeExecutor::Impl {
         e.module = device.CreateShaderModule(&desc);
         const uint64_t t1 = now_ns();
         e.worker_ns = t1 - t0;
+        const uint64_t c1 = os::this_thread_cpu_ns();
+        e.worker_cpu_ns = c1 > c0 ? c1 - c0 : 0;
         e.worker_private_mb = host_private_mb();
         // Keep WGSL-derived entry points and fragment-output decisions tied to the source used
         // to create this module, even if its pack is later replaced or changed in place.
@@ -4667,6 +4672,12 @@ struct NativeExecutor::Impl {
             stats.shader_async_max_ns = e.worker_ns;
             stats.shader_async_max_hash = e.hash;
             stats.shader_async_max_bytes = e.worker_code_bytes;
+            stats.shader_async_max_cpu_ns = e.worker_cpu_ns;
+        }
+        if (e.worker_ns >= kSlowShaderLogNs) {
+            ++stats.shader_async_slow;
+            // Mostly off the CPU: the compile waited (disk, paging, a lock), it did not compute.
+            if (e.worker_cpu_ns * 4 < e.worker_ns) ++stats.shader_async_slow_blocked;
         }
         stats.shader_async_private_mb_max = std::max(stats.shader_async_private_mb_max, e.worker_private_mb);
         stats.shader_scans += e.worker_scans;
@@ -4674,9 +4685,12 @@ struct NativeExecutor::Impl {
         if (e.worker_miss) ++stats.shader_pack_misses;
         if (e.worker_ns >= kSlowShaderLogNs && slow_shader_logs < 32) {
             ++slow_shader_logs;
-            std::fprintf(stderr, "[native_exec] shader worker: 0x%016llx, %llu WGSL bytes, module %llu ms, host private %llu MB\n",
+            std::fprintf(stderr,
+                         "[native_exec] shader worker: 0x%016llx, %llu WGSL bytes, module %llu ms (cpu %llu ms%s), host private %llu MB\n",
                          static_cast<unsigned long long>(e.hash), static_cast<unsigned long long>(e.worker_code_bytes),
                          static_cast<unsigned long long>(e.worker_ns / 1000000),
+                         static_cast<unsigned long long>(e.worker_cpu_ns / 1000000),
+                         e.worker_cpu_ns * 4 < e.worker_ns ? ", blocked: disk / paging / a lock, not compiling" : "",
                          static_cast<unsigned long long>(e.worker_private_mb));
         }
     }
@@ -10978,6 +10992,8 @@ void NativeExecutor::Impl::snapshot_blob_stats() {
     stats.blob_entries = b.entries;
     stats.blob_total_bytes = b.total_bytes;
     stats.blob_max_bytes = b.max_bytes;
+    stats.blob_io_max_ns = b.io_max_ns;
+    stats.blob_io_slow = b.io_slow;
 }
 
 const ExecutorStats& NativeExecutor::stats() const {
@@ -11097,6 +11113,9 @@ std::string NativeExecutor::stats_json() const {
     }
     num("shader_async_max_bytes", st.shader_async_max_bytes);
     num("shader_async_private_mb_max", st.shader_async_private_mb_max);
+    num("shader_async_max_cpu_ms", st.shader_async_max_cpu_ns / 1000000ull);
+    num("shader_async_slow", st.shader_async_slow);
+    num("shader_async_slow_blocked", st.shader_async_slow_blocked);
     num("shader_async_waits", st.shader_async_waits);
     num("shader_async_wait_ms", st.shader_async_wait_ns / 1000000ull);
     num("pipelines_deferred", st.pipelines_deferred);
@@ -11343,6 +11362,8 @@ std::string NativeExecutor::stats_json() const {
         bn("entries", st.blob_entries);
         bn("total_bytes", st.blob_total_bytes);
         bn("max_bytes", st.blob_max_bytes);
+        bn("io_max_ms", st.blob_io_max_ns / 1000000ull);
+        bn("io_slow", st.blob_io_slow);
         j += "}, ";
     }
     if (impl_->device_error_kinds.total() > 0) j += "\"device_error_kinds\": " + impl_->device_error_kinds.json() + ", ";
