@@ -5050,6 +5050,54 @@ void test_view_dimension_matches_entry(NativeExecutor& ex) {
     CHECK(ex.stats().view_dim_unfixable == before.view_dim_unfixable + 1);
 }
 
+// A title view whose array layer / mip range runs past the texture (an array T# longer than the resource):
+// the view covers the layers / mips the texture has, on the texture itself and on its norm16 float twin (which
+// used to take the title's raw range even where the entry had cut the view to one slice). No Dawn error.
+void test_view_range_past_texture(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    // 0: rgba8unorm, 1 layer, 1 mip; 1: rgba16unorm (norm16, read through its float twin), 1 layer
+    emit(setup, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(9660, 4, 4, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 22)));
+    emit(setup, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(9661, 4, 4, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 36)));
+    struct Case {
+        uint32_t tex;
+        uint8_t entry_dim, view_dim;
+        uint32_t base_mip, mip_count, base_layer, layer_count;
+    };
+    const Case cases[] = {
+        {9660, 3, 3, 0, 1, 0, 4},  // 2d-array view of 4 layers over 1
+        {9660, 2, 2, 0, 3, 0, 1},  // 3 mips over 1
+        {9661, 2, 3, 0, 1, 0, 4},  // the entry takes one slice; the twin view must too
+        {9661, 3, 3, 0, 1, 0, 4},  // the twin of a 2d-array view of 4 layers over 1
+    };
+    uint32_t id = 9670;
+    for (const Case& c : cases) {
+        std::vector<uint8_t> bgl;
+        append(bgl, GpuCreateBindGroupLayoutPayload{id, 1, 0, 0, 0});
+        append(bgl, layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Texture, 0, c.entry_dim));
+        emit(setup, GpuOpcode::CreateBindGroupLayout, bgl);
+        GpuBindGroupEntry2 be = bg_entry(0, GpuBindResourceType::TextureView, c.tex);
+        be.view.dimension = c.view_dim;
+        be.view.base_mip_level = c.base_mip;
+        be.view.mip_level_count = c.mip_count;
+        be.view.base_array_layer = c.base_layer;
+        be.view.array_layer_count = c.layer_count;
+        create_bind_group(setup, id + 1, id, {be});
+        id += 2;
+    }
+    run(ex, setup);
+    ex.wait_idle();
+    ex.poll();
+    const ExecutorStats& s = ex.stats();
+    CHECK(s.device_errors == before.device_errors);
+    CHECK(s.view_layers_clamped == before.view_layers_clamped + 2);
+    CHECK(s.view_mips_clamped == before.view_mips_clamped + 1);
+    CHECK(s.view_range_unfixable == before.view_range_unfixable);
+    CHECK(s.norm16_twin_binds == before.norm16_twin_binds + 2);
+}
+
 const char* kAliasCompute = R"(
 @group(0) @binding(0) var<storage, read_write> out: array<u32>;
 @group(%G%) @binding(%B%) var<storage, read> inp: array<u32>;
@@ -5616,6 +5664,7 @@ int main() {
     test_bind_group_binding_fit(*ex);
     test_srgb_view_of_storage_texture(*ex);
     test_view_dimension_matches_entry(*ex);
+    test_view_range_past_texture(*ex);
     test_storage_buffer_aliasing(*ex, false);
     test_storage_buffer_aliasing(*ex, true);
     test_storage_buffer_two_writers(*ex);

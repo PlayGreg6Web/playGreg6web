@@ -5294,14 +5294,48 @@ struct NativeExecutor::Impl {
         return slot.tex;
     }
 
-    wgpu::TextureView depth_twin_view(TextureEntry& t, DepthRead k, const GpuTextureViewDesc& d) {
+    // The range of view `d` cut to texture `t` (fit_view_range, view_alias_model.h); twins have the texture's
+    // extent, mips and layers. Counted; the first cases are logged with the texture and the title's range.
+    void fit_range_to_texture(const TextureEntry& t, uint8_t view_dim, uint32_t& base_mip, uint32_t& mip_count,
+                              uint32_t& base_layer, uint32_t& layer_count, const char* what) {
+        const ViewRangeFit f = fit_view_range(t.geom.dimension, t.geom.depth_or_layers, t.geom.mips, view_dim, base_mip,
+                                              mip_count, base_layer, layer_count);
+        if (f.fit == RangeFit::Same) return;
+        if (f.fit == RangeFit::Unfixable) ++stats.view_range_unfixable;
+        if (f.mips_clamped) ++stats.view_mips_clamped;
+        if (f.layers_clamped) ++stats.view_layers_clamped;
+        if (stats.view_range_unfixable + stats.view_mips_clamped + stats.view_layers_clamped <= 16)
+            std::fprintf(stderr,
+                         "[native-exec] %s range %s: tex dim=%u %ux%u layers=%u mips=%u fmt=%u; view dim=%u mips %u+%u "
+                         "layers %u+%u\n",
+                         what, f.fit == RangeFit::Unfixable ? "past the texture (left)" : "cut to the texture",
+                         (unsigned)t.geom.dimension, t.geom.width, t.geom.height, t.geom.depth_or_layers, t.geom.mips,
+                         (unsigned)t.geom.format, (unsigned)view_dim, base_mip, mip_count, base_layer, layer_count);
+        base_mip = f.base_mip;
+        mip_count = f.mip_count;
+        base_layer = f.base_layer;
+        layer_count = f.layer_count;
+    }
+
+    // A twin view's descriptor from the title's view `d` (twin_format / norm_twin_format): dimension and range as
+    // texture_view would make them, so a twin never takes a range the texture itself could not.
+    wgpu::TextureViewDescriptor twin_view_desc(const TextureEntry& t, wgpu::TextureFormat format,
+                                               const GpuTextureViewDesc& d, const char* what) {
+        uint32_t base_mip = d.base_mip_level, mip_count = d.mip_level_count;
+        uint32_t base_layer = d.base_array_layer, layer_count = d.array_layer_count;
+        fit_range_to_texture(t, d.dimension, base_mip, mip_count, base_layer, layer_count, what);
         wgpu::TextureViewDescriptor vd{};
-        vd.format = twin_format(k);
+        vd.format = format;
         if (d.dimension) vd.dimension = wgpu_view_dim(d.dimension);
-        vd.baseMipLevel = d.base_mip_level;
-        if (d.mip_level_count) vd.mipLevelCount = d.mip_level_count;
-        vd.baseArrayLayer = d.base_array_layer;
-        if (d.array_layer_count) vd.arrayLayerCount = d.array_layer_count;
+        vd.baseMipLevel = base_mip;
+        if (mip_count) vd.mipLevelCount = mip_count;
+        vd.baseArrayLayer = base_layer;
+        if (layer_count) vd.arrayLayerCount = layer_count;
+        return vd;
+    }
+
+    wgpu::TextureView depth_twin_view(TextureEntry& t, DepthRead k, const GpuTextureViewDesc& d) {
+        const wgpu::TextureViewDescriptor vd = twin_view_desc(t, twin_format(k), d, "depth twin view");
         return t.twins[static_cast<size_t>(k)].tex.CreateView(&vd);
     }
 
@@ -5565,9 +5599,10 @@ struct NativeExecutor::Impl {
                 mip_count = 1;
             }
         }
-        // A mip range past the host texture's mips (its mip chain was created shorter than the title's view
-        // asks for): the mips that exist, not an invalid view (which invalidates every bind group using it).
-        if (mip_count && base_mip < t.geom.mips && uint64_t{base_mip} + mip_count > t.geom.mips) mip_count = t.geom.mips - base_mip;
+        // A mip / layer range past the host texture (its mip chain was created shorter, an array T# runs past
+        // the resource): the subresources that exist, not an invalid view (which invalidates every bind group
+        // using it).
+        fit_range_to_texture(t, dim, base_mip, mip_count, base_layer, layer_count, "view");
         if (!fmt && !dim && !aspect && !base_mip && !mip_count && !base_layer && !layer_count) return t.default_view;
         const uint64_t key = uint64_t{fmt} | (uint64_t{dim} << 8) | (uint64_t{aspect} << 16) |
                              (uint64_t{base_mip & 0xffff} << 24) | (uint64_t{mip_count & 0xffff} << 40) |
@@ -7332,13 +7367,10 @@ struct NativeExecutor::Impl {
                         // norm16: a float copy (norm16_twin); the dummy only when no twin can exist
                         const uint32_t nc = norm16_components(tex_format);
                         if (nc != 0 && tex_format == t.geom.format && norm16_twin(e.resource_id, t)) {
-                            wgpu::TextureViewDescriptor vd2{};
-                            vd2.format = norm_twin_format(nc);
-                            if (e.view.dimension) vd2.dimension = wgpu_view_dim(e.view.dimension);
-                            vd2.baseMipLevel = e.view.base_mip_level;
-                            if (e.view.mip_level_count) vd2.mipLevelCount = e.view.mip_level_count;
-                            vd2.baseArrayLayer = e.view.base_array_layer;
-                            if (e.view.array_layer_count) vd2.arrayLayerCount = e.view.array_layer_count;
+                            // ev: the view fitted to the layout entry above (the title's own range can be
+                            // longer than the texture when the entry took a single slice of it)
+                            const wgpu::TextureViewDescriptor vd2 =
+                                twin_view_desc(t, norm_twin_format(nc), ev, "norm16 twin view");
                             pe.view = t.norm_twin.tex.CreateView(&vd2);
                             have = static_cast<bool>(pe.view);
                             if (have) ++stats.norm16_twin_binds;
@@ -11756,6 +11788,9 @@ std::string NativeExecutor::stats_json() const {
     num("bind_group_depth_layout_dummies", st.bind_group_depth_layout_dummies);
     num("view_dim_coerced", st.view_dim_coerced);
     num("view_dim_unfixable", st.view_dim_unfixable);
+    num("view_layers_clamped", st.view_layers_clamped);
+    num("view_mips_clamped", st.view_mips_clamped);
+    num("view_range_unfixable", st.view_range_unfixable);
     num("storage_alias_copies", st.storage_alias_copies);
     num("query_sets_created", st.query_sets_created);
     num("query_begins", st.query_begins);

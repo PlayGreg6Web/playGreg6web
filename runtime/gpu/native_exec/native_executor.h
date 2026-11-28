@@ -426,6 +426,9 @@ struct ExecutorStats {
     uint64_t v1_min_size_unfit = 0;  // no fit (left as the title bound it)
     uint64_t view_dim_coerced = 0;         // texture views re-created with the layout entry's viewDimension (cube-array view meeting a 2d entry, ...)
     uint64_t view_dim_unfixable = 0;       // view dimension mismatches the texture cannot satisfy (cube entry over < 6 layers)
+    uint64_t view_layers_clamped = 0;      // texture views whose array layer range ran past the texture, cut to its layers
+    uint64_t view_mips_clamped = 0;        // texture views whose mip range ran past the texture, cut to its mips
+    uint64_t view_range_unfixable = 0;     // texture views starting past the texture (or a cube over < 6 layers): left to Dawn
     uint64_t storage_alias_copies = 0;     // read-only buffer bindings overlapping a writable one, bound through a copy
     // Guest query heaps (kGpuOpcodeCreateQuerySet / Query / ResolveQuery).
     uint64_t query_sets_created = 0;       // guest query heaps with a query set (occlusion results / timestamp set)

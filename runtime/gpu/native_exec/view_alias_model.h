@@ -62,6 +62,57 @@ inline EntryViewFit fit_view_to_entry(uint8_t tex_dim, uint32_t tex_layers, uint
     return r;
 }
 
+// A view's subresource range must lie inside the texture it is created on (Dawn: "Texture view array layer
+// range (baseArrayLayer, arrayLayerCount) exceeds the texture's array layer count", the same for mips). A
+// title's T# / SRV range can be longer than the host texture: an array T# whose last slice is past the
+// resource, a mip chain the host created shorter. The view covers what the texture has (the GFX10 sampler
+// clamps the slice / level to the view's range, WebGPU clamps to the view's count: the same texels for every
+// index that exists). A range that starts past the texture has no such view and is left as it is.
+enum class RangeFit : uint8_t {
+    Same,       // inside the texture
+    Clamped,    // the mip and / or layer count cut to what the texture has
+    Unfixable,  // the base mip / layer is past the texture, or a cube view over fewer than 6 layers
+};
+
+struct ViewRangeFit {
+    RangeFit fit = RangeFit::Same;
+    bool mips_clamped = false, layers_clamped = false;
+    uint32_t base_mip = 0, mip_count = 0;      // 0 = all remaining
+    uint32_t base_layer = 0, layer_count = 0;  // 0 = all remaining
+};
+
+// tex_dim: 0 1d, 1 2d, 2 3d (a 3d texture has one array layer: its depth is not layers). tex_layers / tex_mips:
+// the host texture's. view_dim: the view's code (0 default ... 6 3d, see ViewFit above).
+inline ViewRangeFit fit_view_range(uint8_t tex_dim, uint32_t tex_layers, uint32_t tex_mips, uint8_t view_dim,
+                                   uint32_t base_mip, uint32_t mip_count, uint32_t base_layer, uint32_t layer_count) {
+    ViewRangeFit r;
+    r.base_mip = base_mip;
+    r.mip_count = mip_count;
+    r.base_layer = base_layer;
+    r.layer_count = layer_count;
+    const uint32_t mips = std::max(1u, tex_mips);
+    const uint32_t layers = tex_dim == 2 ? 1u : std::max(1u, tex_layers);
+    if (base_mip >= mips || base_layer >= layers) {
+        r.fit = RangeFit::Unfixable;
+        return r;
+    }
+    if (mip_count && uint64_t{base_mip} + mip_count > mips) {
+        r.mip_count = mips - base_mip;
+        r.mips_clamped = true;
+    }
+    if (layer_count && uint64_t{base_layer} + layer_count > layers) {
+        const uint32_t avail = layers - base_layer;
+        if (view_dim == 4 || (view_dim == 5 && avail < 6)) {  // a cube needs 6 layers
+            r.fit = RangeFit::Unfixable;
+            return r;
+        }
+        r.layer_count = view_dim == 5 ? avail / 6 * 6 : avail;
+        r.layers_clamped = true;
+    }
+    if (r.mips_clamped || r.layers_clamped) r.fit = RangeFit::Clamped;
+    return r;
+}
+
 // One buffer binding of a dispatch (offset already includes any dynamic offset; size is explicit).
 struct AliasBinding {
     uint64_t buffer = 0;  // identity of the buffer

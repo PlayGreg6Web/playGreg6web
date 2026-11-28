@@ -1389,6 +1389,30 @@ void test_view_alias_model() {
     f = fit_view_to_entry(1, 6, 5, 0, 6, 6);  // neither is a 3d entry
     CHECK(f.fit == ViewFit::Same);
 
+    // view range vs the texture's layers / mips
+    ViewRangeFit r = fit_view_range(1, 1, 1, 3, 0, 1, 0, 4);  // 2d-array view of 4 layers over 1
+    CHECK(r.fit == RangeFit::Clamped && r.layers_clamped && !r.mips_clamped && r.layer_count == 1);
+    r = fit_view_range(1, 6, 1, 3, 0, 0, 2, 0);  // all remaining: untouched
+    CHECK(r.fit == RangeFit::Same && r.base_layer == 2 && r.layer_count == 0);
+    r = fit_view_range(1, 8, 1, 3, 0, 1, 2, 8);  // layers 2..9 over 8: 2..7
+    CHECK(r.fit == RangeFit::Clamped && r.base_layer == 2 && r.layer_count == 6);
+    r = fit_view_range(1, 1, 3, 2, 1, 5, 0, 1);  // mips 1..5 over 3: 1..2
+    CHECK(r.fit == RangeFit::Clamped && r.mips_clamped && r.base_mip == 1 && r.mip_count == 2);
+    r = fit_view_range(1, 4, 1, 3, 0, 1, 4, 1);  // starts past the last layer
+    CHECK(r.fit == RangeFit::Unfixable && r.base_layer == 4 && r.layer_count == 1);
+    r = fit_view_range(1, 1, 2, 2, 2, 1, 0, 1);  // starts past the last mip
+    CHECK(r.fit == RangeFit::Unfixable);
+    r = fit_view_range(1, 4, 1, 4, 0, 1, 0, 6);  // a cube over 4 layers
+    CHECK(r.fit == RangeFit::Unfixable);
+    r = fit_view_range(1, 14, 1, 5, 0, 1, 0, 18);  // cube-array of 3 cubes over 14 layers: 2 cubes
+    CHECK(r.fit == RangeFit::Clamped && r.layer_count == 12);
+    r = fit_view_range(2, 8, 1, 6, 0, 1, 0, 0);  // a 3d texture's depth is not layers: default view is fine
+    CHECK(r.fit == RangeFit::Same);
+    r = fit_view_range(2, 8, 1, 6, 0, 1, 0, 8);  // ... and a layer count over it is one layer
+    CHECK(r.fit == RangeFit::Clamped && r.layer_count == 1);
+    r = fit_view_range(1, 6, 4, 4, 0, 4, 0, 6);  // inside
+    CHECK(r.fit == RangeFit::Same);
+
     // buffer aliasing
     auto bind = [](uint64_t buf, uint32_t g, uint32_t b, uint64_t off, uint64_t size, bool w) {
         AliasBinding a;
