@@ -414,6 +414,14 @@ struct ExecutorStats {
     uint64_t remap_min_size_twins = 0;     // bound as a zero-padded copy (the buffer ends first)
     uint64_t remap_min_size_splits = 0;    // passes split to encode those copies
     uint64_t remap_min_size_dummies = 0;   // no copy possible: a dummy
+    // The same for explicit (CreateBindGroup2, manifest layouts included) and v1 bind groups: the layout's / the
+    // reflected group's minBindingSize
+    uint64_t explicit_min_size_extended = 0;
+    uint64_t explicit_min_size_twins = 0;   // bound as a zero-padded copy taken at creation
+    uint64_t explicit_min_size_dummies = 0;
+    uint64_t v1_min_size_extended = 0;
+    uint64_t v1_min_size_twins = 0;
+    uint64_t v1_min_size_unfit = 0;  // no fit (left as the title bound it)
     uint64_t view_dim_coerced = 0;         // texture views re-created with the layout entry's viewDimension (cube-array view meeting a 2d entry, ...)
     uint64_t view_dim_unfixable = 0;       // view dimension mismatches the texture cannot satisfy (cube entry over < 6 layers)
     uint64_t storage_alias_copies = 0;     // read-only buffer bindings overlapping a writable one, bound through a copy

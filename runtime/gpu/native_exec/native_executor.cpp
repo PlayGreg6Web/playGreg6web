@@ -281,6 +281,9 @@ struct BglEntry {
     wgpu::BindGroupLayout layout;
     std::vector<LayoutEntry> entries;
     bool entries_known = true;
+    // A manifest layout (entries_known false) still has its buffer entries: their kind and minBindingSize
+    // size the buffer ranges its bind groups bind (the layout rejects a smaller binding).
+    std::vector<LayoutEntry> manifest_buffers;
     // Over a per-stage limit on its own (an invalid layout): its bind groups are recorded for the remap
     // but not created, and never bound (an invalid bind group in a pass invalidates the command buffer).
     bool over_limits = false;
@@ -5704,6 +5707,16 @@ struct NativeExecutor::Impl {
             BglEntry b;
             b.layout = layout;
             b.entries_known = false;  // `entries: null`
+            for (const reflect::LayoutEntryDesc& d : *entries) {
+                if (d.kind != reflect::LayoutEntryDesc::Kind::Buffer) continue;
+                LayoutEntry me;
+                me.binding = d.binding;
+                me.kind = 0;
+                me.subtype = d.buffer_type;
+                me.dynamic = d.has_dynamic_offset;
+                me.min_binding_size = d.min_binding_size;
+                b.manifest_buffers.push_back(me);
+            }
             bgls[h.id] = std::move(b);
             ++stats.bind_group_layouts;
             ++stats.manifest_layouts_resolved;
@@ -6804,6 +6817,36 @@ struct NativeExecutor::Impl {
                 pe.buffer = it->second.buffer;
                 pe.offset = e.offset;
                 if (e.size > 0) pe.size = e.size;
+                // The reflected group's minBindingSize (the pipeline's layout rejects a smaller binding):
+                // extended within the buffer, else a zero-padded copy of the range, else the whole range as given.
+                if (synth_entries) {
+                    for (const reflect::LayoutEntryDesc& d : *synth_entries) {
+                        if (d.kind != reflect::LayoutEntryDesc::Kind::Buffer || d.binding != e.binding || !d.min_binding_size)
+                            continue;
+                        const uint64_t buf_size = it->second.size;
+                        const bool storage = d.buffer_type != 0;
+                        const BufferBindingFit fit = fit_buffer_binding(
+                            storage, buf_size, e.offset, e.size, d.min_binding_size,
+                            storage ? max_storage_binding : max_uniform_binding, true);
+                        if (!fit.ok) {
+                            ++stats.v1_min_size_unfit;
+                        } else if (fit.padded) {
+                            wgpu::Buffer twin = static_min_twin(pe.buffer, e.offset, fit.data_size, fit.size);
+                            if (twin) {
+                                ++stats.v1_min_size_twins;
+                                pe.buffer = twin;
+                                pe.offset = 0;
+                                pe.size = fit.size;
+                            } else {
+                                ++stats.v1_min_size_unfit;
+                            }
+                        } else if (fit.extended) {
+                            ++stats.v1_min_size_extended;
+                            pe.size = fit.size;
+                        }
+                        break;
+                    }
+                }
             } else if (e.resource_type == static_cast<uint32_t>(GpuBindResourceType::TextureView)) {
                 auto it = textures.find(e.resource_id);
                 if (it == textures.end() || !it->second.default_view) {
@@ -6992,6 +7035,23 @@ struct NativeExecutor::Impl {
         bg_infos[g.Get()] = std::move(info);
     }
 
+    // The explicit bind groups' counterpart of min_size_twin: a persistent group cannot refill a twin per
+    // bind, so the copy of the range (zero past it) is taken when the group is created. Null: no copy possible.
+    wgpu::Buffer static_min_twin(const wgpu::Buffer& src, uint64_t offset, uint64_t data, uint64_t size) {
+        if (!src || !(src.GetUsage() & wgpu::BufferUsage::CopySrc) || offset % 4 != 0 || data == 0 ||
+            offset + data > src.GetSize())
+            return {};
+        wgpu::BufferDescriptor bd{};
+        bd.size = std::max<uint64_t>(256, (size + 255) & ~uint64_t{255});
+        bd.usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst;
+        wgpu::Buffer twin = device.CreateBuffer(&bd);
+        wgpu::CommandEncoder enc = device.CreateCommandEncoder();
+        enc.CopyBufferToBuffer(src, offset, twin, 0, data);
+        wgpu::CommandBuffer cb = enc.Finish();
+        queue.Submit(1, &cb);
+        return twin;
+    }
+
     bool create_bind_group2(const Packet& p) {
         if (p.payload_bytes < 16) return false;
         const auto h = read_payload<GpuCreateBindGroup2Payload>(p);
@@ -7027,6 +7087,11 @@ struct NativeExecutor::Impl {
             const LayoutEntry* le = nullptr;
             for (const LayoutEntry& x : rec.entries)
                 if (x.binding == e.binding) { le = &x; break; }
+            // A manifest layout has no entry list but still its buffer entries' type and minBindingSize.
+            const LayoutEntry* mle = nullptr;
+            if (!le)
+                for (const LayoutEntry& x : rec.manifest_buffers)
+                    if (x.binding == e.binding) { mle = &x; break; }
             const bool expects_buffer = le && le->kind == 0, expects_texture = le && (le->kind == 2 || le->kind == 3),
                        expects_sampler = le && le->kind == 1;
             const uint32_t type = e.resource_type;
@@ -7098,6 +7163,7 @@ struct NativeExecutor::Impl {
                     if (expects_buffer) required_usage = le->subtype == 0 ? 0x40u : 0x80u;
                     const bool usage_mismatch = expects_buffer && required_usage && !(b.usage & required_usage);
                     uint64_t min_binding = expects_buffer && !usage_mismatch ? le->min_binding_size : 0;
+                    if (mle) min_binding = mle->min_binding_size;
                     if (buf_size && buf_offset >= buf_size) {
                         if (le) use_dummy(*le);
                     } else {
@@ -7140,15 +7206,35 @@ struct NativeExecutor::Impl {
                             } else {
                                 // Into the device's binding-size rules (binding_fit_model.h): a uniform
                                 // range over 64 KiB, an unaligned storage range, ... is cut, not rejected.
-                                const bool storage = le && le->kind == 0 && le->subtype != 0;
+                                const LayoutEntry* fe = le ? le : mle;
+                                const bool storage = fe && fe->kind == 0 && fe->subtype != 0;
                                 const BufferBindingFit fit = fit_buffer_binding(
                                     storage, buf_size, buf_offset, eff, min_binding,
-                                    !le || le->kind != 0 ? 0 : storage ? max_storage_binding : max_uniform_binding);
-                                if (!fit.ok) {
+                                    !fe || fe->kind != 0 ? 0 : storage ? max_storage_binding : max_uniform_binding, true);
+                                wgpu::Buffer twin;
+                                if (fit.ok && fit.padded) {
+                                    // The buffer ends before the layout's minimum: a zero-padded copy of the range.
+                                    twin = static_min_twin(b.buffer, buf_offset, fit.data_size, fit.size);
+                                    if (twin) ++stats.explicit_min_size_twins;
+                                }
+                                if (!fit.ok || (fit.padded && !twin)) {
                                     ++stats.buffer_bindings_dummied;
-                                    use_dummy(*le);
+                                    if (min_binding) ++stats.explicit_min_size_dummies;
+                                    if (le) use_dummy(*le);
+                                    else if (fe) {
+                                        pe.buffer = dummy_resource(*fe, h.layout_id).buffer;
+                                        pe.offset = 0;
+                                        pe.size = wgpu::kWholeSize;
+                                        have = true;
+                                    }
+                                } else if (twin) {
+                                    pe.buffer = twin;
+                                    pe.offset = 0;
+                                    pe.size = fit.size;
+                                    have = true;  // not a real_buffer: the usage scope sees the original only through the remap record
                                 } else {
                                     if (fit.clamped) ++stats.buffer_bindings_clamped;
+                                    if (fit.extended) ++stats.explicit_min_size_extended;
                                     pe.buffer = b.buffer;
                                     pe.offset = buf_offset;
                                     pe.size = fit.size > 0 ? fit.size : wgpu::kWholeSize;
@@ -9000,6 +9086,10 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                             le = x;
                             le.min_binding_size = std::max<uint64_t>(x.min_binding_size, se.min_binding_size);
                         }
+                    // The dummy covers the WGSL binding's minimum size too (its reflection can ask for more than
+                    // the synthesized entry's default).
+                    if (le.kind == 0 && i < meta.min_sizes.size())
+                        le.min_binding_size = std::max<uint64_t>(le.min_binding_size, meta.min_sizes[i]);
                     const Dummy d = dummy_resource(le);
                     w.buffer = d.buffer;
                     w.sampler = d.sampler;
@@ -11457,6 +11547,12 @@ std::string NativeExecutor::stats_json() const {
     num("buffer_bindings_dummied", st.buffer_bindings_dummied);
     num("remap_min_size_extended", st.remap_min_size_extended);
     num("remap_min_size_twins", st.remap_min_size_twins);
+    num("explicit_min_size_extended", st.explicit_min_size_extended);
+    num("explicit_min_size_twins", st.explicit_min_size_twins);
+    num("explicit_min_size_dummies", st.explicit_min_size_dummies);
+    num("v1_min_size_extended", st.v1_min_size_extended);
+    num("v1_min_size_twins", st.v1_min_size_twins);
+    num("v1_min_size_unfit", st.v1_min_size_unfit);
     num("remap_min_size_splits", st.remap_min_size_splits);
     num("remap_min_size_dummies", st.remap_min_size_dummies);
     num("depth_float_copies", st.depth_float_copies);

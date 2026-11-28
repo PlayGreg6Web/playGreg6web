@@ -1445,6 +1445,14 @@ void test_binding_fit() {
     CHECK(!fit_buffer_binding(false, 4096, 0, 0, 131072, 65536, true).ok);  // minimum over the device limit
     f = fit_buffer_binding(false, 4096, 0, 64, 256, 65536, true);  // room in the buffer: extended, no twin
     CHECK(f.ok && f.extended && !f.padded && f.size == 256);
+    // explicit bind groups (CreateBindGroup2 / manifest layouts / v1 over a reflected group): a 16-byte
+    // uniform view against a 48-byte minimum, near the end of the buffer and at it
+    f = fit_buffer_binding(false, 4096, 4000, 16, 48, 65536, true);  // 96 bytes left: extended in place
+    CHECK(f.ok && f.extended && !f.padded && f.size == 48);
+    f = fit_buffer_binding(false, 4096, 4064, 16, 48, 65536, true);  // 32 bytes left: a 48-byte twin of 32 data bytes
+    CHECK(f.ok && f.padded && f.size == 48 && f.data_size == 32);
+    f = fit_buffer_binding(true, 4096, 4088, 8, 50, 1u << 27, true);  // storage: min rounded up to whole words
+    CHECK(f.ok && f.padded && f.size == 52 && f.data_size == 8);
     // size unknown: unchanged
     f = fit_buffer_binding(false, 0, 0, 0, 0, 65536);
     CHECK(f.ok && f.size == 0);
