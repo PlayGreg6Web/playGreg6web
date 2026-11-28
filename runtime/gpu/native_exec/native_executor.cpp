@@ -3016,24 +3016,35 @@ struct NativeExecutor::Impl {
         // every attempt after the first makes a new instance (and surface) once everything is released.
         // Backoff 0, 250, 500, 1000, 2000, 4000 ms: the driver resets the adapter after a TDR (seconds).
         static constexpr int kAttempts = 6;
+        // A removed adapter (DXGI_ERROR_DEVICE_HUNG / _REMOVED / _RESET): the first attempt makes the new
+        // instance as well; a creation on the old one only returns DXGI_ERROR_DEVICE_REMOVED again.
+        const bool adapter_removed = !stats.device_removed_reason.empty();
+        auto ms_since = [](uint64_t t) { return static_cast<unsigned long long>((now_ns() - t) / 1000000ull); };
         for (int attempt = 0; attempt < kAttempts && !ok; ++attempt) {
+            const uint64_t ta = now_ns();
             release_device_objects();
             if (attempt == 0) sample_memory("released");  // what the old device left behind
-            if (attempt) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(250ll << (attempt - 1)));
+            const unsigned long long release_ms = ms_since(ta);
+            if (attempt) std::this_thread::sleep_for(std::chrono::milliseconds(250ll << (attempt - 1)));
+            const uint64_t ti = now_ns();
+            if (attempt || adapter_removed) {
                 std::string ierr;
                 if (!reset_instance(&ierr)) {
                     last_error = ierr;
                     continue;
                 }
             }
+            const unsigned long long instance_ms = ms_since(ti);
             ++stats.recovery_attempts;
             lost = false;
             CreateStatus st = CreateStatus::Failed;
             std::string err;
-            if (!acquire_device(&st, &err)) {
+            const uint64_t td = now_ns();
+            const bool acquired = acquire_device(&st, &err);
+            std::fprintf(stderr, "[native_exec] recovery attempt %d: release %llu ms, instance %llu ms, device %llu ms: %s\n",
+                         attempt + 1, release_ms, instance_ms, ms_since(td), acquired ? "ok" : err.c_str());
+            if (!acquired) {
                 last_error = err;
-                std::fprintf(stderr, "[native_exec] recovery attempt %d failed: %s\n", attempt + 1, err.c_str());
                 continue;
             }
             if (!features_equal(before, features)) return fail_fatal("the new device lacks features the old one had");
