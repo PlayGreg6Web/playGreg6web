@@ -314,12 +314,27 @@ struct FitDummies {
     std::array<wgpu::BindGroup, kFitMaxGroups> groups;
 };
 
+// What a snapshot of a bound resource copies from (usage_scope_model.h).
+struct BgSnapSrc {  // parallel to BgUses::uses
+    wgpu::Buffer buffer;
+    wgpu::Texture texture;
+    wgpu::TextureFormat tex_format = wgpu::TextureFormat::Undefined;
+    wgpu::TextureFormat view_format = wgpu::TextureFormat::Undefined;
+    bool tex_3d = false;
+    uint32_t width = 1, height = 1, depth = 1;  // the texture's mip 0 size (depth: 3D only)
+    uint8_t view_dim = 2;  // resolved view dimension code
+    bool copyable = true;  // colour, single-sampled, not block-compressed
+};
 // A bind group's recorded descriptor (`bindGroupDescriptors`): the real (non-dummy) resources with
 // the facts the layout:'auto' remap matches on, and the handles to bind.
 struct BgHandles {
     wgpu::Buffer buffer;
     wgpu::TextureView view;
     wgpu::Sampler sampler;
+    // A storage-capable texture's view: its usage-scope record (subresources; the kind is set by whatever
+    // binding the remap puts it in) and snapshot source, so a remapped group is checked like any other.
+    std::optional<ResUse> tex_use;
+    BgSnapSrc tex_src;
 };
 struct BgDesc {
     std::vector<RemapResource> model;
@@ -362,16 +377,6 @@ struct BgInfo {
 
 // A bind group's storage-capable resources (usage_scope_model.h) and what a snapshot of one needs: the
 // group's layout and entries (to build the group again with the snapshot in that entry) and the source.
-struct BgSnapSrc {  // parallel to BgUses::uses
-    wgpu::Buffer buffer;
-    wgpu::Texture texture;
-    wgpu::TextureFormat tex_format = wgpu::TextureFormat::Undefined;
-    wgpu::TextureFormat view_format = wgpu::TextureFormat::Undefined;
-    bool tex_3d = false;
-    uint32_t width = 1, height = 1, depth = 1;  // the texture's mip 0 size (depth: 3D only)
-    uint8_t view_dim = 2;  // resolved view dimension code
-    bool copyable = true;  // colour, single-sampled, not block-compressed
-};
 struct BgUsage {
     BgUses m;
     std::vector<BgSnapSrc> src;
@@ -401,6 +406,7 @@ struct AutoLayoutMeta {
 
 struct RemapCacheEntry {
     wgpu::BindGroup group;  // null: the remap came out empty (or invalid)
+    std::shared_ptr<const BgUsage> usage;  // its storage-capable resources (null: none)
     bool invalid = false;   // Dawn rejected the remapped group: never encoded
     const BgDesc* desc = nullptr;
     uint64_t gen = 0;
@@ -7113,6 +7119,7 @@ struct NativeExecutor::Impl {
             // Its usage-scope record (storage-capable resources bound as themselves; usage_scope_model.h).
             std::optional<ResUse> ru;
             BgSnapSrc rs;
+            bool remap_only_use = false;  // ru describes rh only: the group itself binds a dummy there
             auto tex_use = [&](TextureEntry& t, const GpuTextureViewDesc& v, bool one_mip, UseKind kind, uint8_t view_fmt) {
                 uint8_t dim = v.dimension;
                 uint32_t bm = v.base_mip_level, mc = one_mip ? 1u : v.mip_level_count;
@@ -7376,8 +7383,11 @@ struct NativeExecutor::Impl {
                             rh.view = pe.view;
                             if (kind_mismatch) use_dummy(*le);
                             else have = true;
-                            if (have && (t.usage & 0x8u) && le && le->kind == 2)
+                            if (t.usage & 0x8u) {
                                 tex_use(t, e.view, false, UseKind::Sampled, tex_format);
+                                // bound as a dummy here: the record only serves the remap (BgHandles::tex_use)
+                                remap_only_use = !(have && !kind_mismatch && le && le->kind == 2);
+                            }
                         }
                     }
                     pe.tex_writable = !kind_mismatch && le && le->kind == 3 && le->subtype != 1;
@@ -7424,9 +7434,14 @@ struct NativeExecutor::Impl {
                 return fail("bind group " + std::to_string(h.id) + ": binding " + std::to_string(e.binding) +
                             " resource " + std::to_string(e.resource_id) + " unavailable");
             if (rec_real) {
+                if (ru && ru->texture && rh.view) {
+                    rh.tex_use = *ru;
+                    rh.tex_src = rs;
+                }
                 desc->model.push_back(rm);
                 desc->handles.push_back(std::move(rh));
             }
+            if (remap_only_use) ru.reset();
             if (ru) {
                 ru->entry = static_cast<uint32_t>(entries.size());
                 uses.add(*ru);
@@ -9102,6 +9117,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
     struct RemapResult {
         enum class Status { Ok, Empty, Unsupported, Invalid } status = Status::Unsupported;
         wgpu::BindGroup group;
+        std::shared_ptr<const BgUsage> usage;  // its storage-capable resources (null: none)
     };
 
     // Slot `slot` of the padded twins for one remapped group (a fresh buffer starts zero; the copy into
@@ -9162,6 +9178,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                 } else if (cit->second.group) {
                     out.status = RemapResult::Status::Ok;
                     out.group = cit->second.group;
+                    out.usage = cit->second.usage;
                 }
                 return out;
             }
@@ -9183,6 +9200,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
             }
         }
         wgpu::BindGroup group;
+        std::shared_ptr<BgUsage> usage;
         bool remap_invalid = false;
         bool twinned = false;  // a padded twin is bound: the group is not cached (the twin is refilled per bind)
         if (auto_bgl) {
@@ -9248,6 +9266,37 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                         w.size = fit.size > 0 ? fit.size : wgpu::kWholeSize;
                         if (r.folded) ++stats.remap_dynamic_offsets;
                         if (r.dyn_clamped) ++stats.remap_dynamic_clamps;
+                    }
+                    // Its usage-scope record (usage_scope_model.h) in the kind this WGSL binding uses it as: the
+                    // remapped group is checked, snapshotted and skipped like a group the stream created. A
+                    // padded twin is a private copy and conflicts with nothing.
+                    std::optional<ResUse> ru;
+                    BgSnapSrc rs;
+                    if (hnd.buffer && !twin && (hnd.buffer.GetUsage() & wgpu::BufferUsage::Storage)) {
+                        ResUse u;
+                        u.res = hnd.buffer.Get();
+                        u.kind = b.kind == WgslBindingKind::Storage           ? UseKind::StorageWrite
+                                 : b.kind == WgslBindingKind::ReadOnlyStorage ? UseKind::StorageRead
+                                                                              : UseKind::Uniform;
+                        u.offset = r.offset;
+                        const uint64_t total = hnd.buffer.GetSize();
+                        u.size = fit.size > 0 ? fit.size : (total > r.offset ? total - r.offset : 0);
+                        u.min_size = i < meta.min_sizes.size() ? meta.min_sizes[i] : 0;
+                        ru = u;
+                        rs.buffer = hnd.buffer;
+                    } else if (hnd.view && hnd.tex_use &&
+                               (b.kind == WgslBindingKind::Texture || b.kind == WgslBindingKind::StorageTexture)) {
+                        ru = *hnd.tex_use;
+                        // a remapped storage texture is write-only (synth_layout_entry) unless reflected otherwise:
+                        // counted writable either way
+                        ru->kind = b.kind == WgslBindingKind::StorageTexture ? UseKind::StorageTexWrite : UseKind::Sampled;
+                        rs = hnd.tex_src;
+                    }
+                    if (ru) {
+                        if (!usage) usage = std::make_shared<BgUsage>();
+                        ru->entry = static_cast<uint32_t>(i);
+                        usage->m.add(*ru);
+                        usage->src.push_back(std::move(rs));
                     }
                 } else if (r.kind == PickResult::Kind::FallbackSampler) {
                     w.sampler = fallback_sampler(b.comparison);
@@ -9316,6 +9365,10 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                              compute ? "compute" : "render", pipeline_id, ents.c_str());
             }
             ++stats.remapped_bind_groups;
+            if (usage) {
+                usage->layout = auto_bgl;
+                usage->entries = wes;
+            }
             std::vector<uint8_t> tex_w(wes.size(), 0);
             for (size_t i = 0; i < wes.size(); ++i) tex_w[i] = meta.bindings[i].kind == WgslBindingKind::StorageTexture ? 1 : 0;
             register_bg_info(group, auto_bgl, wes, [&](size_t i, BgBufInfo& bi) {
@@ -9325,7 +9378,8 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         }
         if (live && !twinned) {
             if (remap_cache.size() >= 8192) remap_cache.clear();
-            remap_cache[key] = RemapCacheEntry{remap_invalid ? nullptr : group, remap_invalid, desc.get(), meta.gen};
+            remap_cache[key] = RemapCacheEntry{remap_invalid ? nullptr : group, remap_invalid ? nullptr : usage,
+                                               remap_invalid, desc.get(), meta.gen};
         }
         if (remap_invalid) {
             ++stats.invalid_bind_groups;
@@ -9333,6 +9387,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         } else if (group) {
             out.status = RemapResult::Status::Ok;
             out.group = group;
+            out.usage = usage;
         }
         return out;
     }
@@ -10313,9 +10368,9 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
     }
 
     // RemappedSetBindGroupCommand.run: `if (!ctl.pass) return`.
-    void apply_remapped(Encoder& e, const wgpu::BindGroup& g) {
+    void apply_remapped(Encoder& e, const RemapResult& r) {
         if (!e.rpass && !e.cpass) return;
-        e.bind(0, g, {}, nullptr);
+        e.bind(0, r.group, {}, r.usage);
         e.invalid_binds &= ~1u;  // a valid group 0 replaces an invalid one
         if (e.rpass) e.group0_bound = true;  // _recordPassBindGroup
         e.bound_groups |= 1u;
@@ -10370,7 +10425,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                 const RemapResult r = get_remapped(e, true, remap.compute_pipe, mit->second, c.bind_group_id, c.desc, c.offsets);
                 remap.group0_compute = true;
                 if (r.status == RemapResult::Status::Ok) {
-                    apply_remapped(e, r.group);
+                    apply_remapped(e, r);
                     return true;
                 }
                 if (r.status == RemapResult::Status::Empty) return true;
@@ -10389,7 +10444,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
                         get_remapped(e, false, remap.render_pipe, pit->second.auto_meta, c.bind_group_id, c.desc, c.offsets);
                     remap.group0_render = true;
                     if (r.status == RemapResult::Status::Ok) {
-                        apply_remapped(e, r.group);
+                        apply_remapped(e, r);
                         return true;
                     }
                     if (r.status == RemapResult::Status::Empty) return true;  // NoopRenderGroup0Command
@@ -10422,7 +10477,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         remap.group0_render = true;
         if (pit == render_pipelines.end()) return;
         const RemapResult r = get_remapped(e, false, remap.render_pipe, pit->second.auto_meta, src.id, src.desc, src.dyn);
-        if (r.status == RemapResult::Status::Ok) apply_remapped(e, r.group);
+        if (r.status == RemapResult::Status::Ok) apply_remapped(e, r);
         else if (r.status == RemapResult::Status::Invalid) e.invalid_binds |= 1u;
     }
     void remap_before_dispatch(Encoder& e) {
@@ -10433,7 +10488,7 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
         remap.group0_compute = true;
         if (mit == compute_meta.end()) return;
         const RemapResult r = get_remapped(e, true, remap.compute_pipe, mit->second, src.id, src.desc, src.dyn);
-        if (r.status == RemapResult::Status::Ok) apply_remapped(e, r.group);
+        if (r.status == RemapResult::Status::Ok) apply_remapped(e, r);
         else if (r.status == RemapResult::Status::Invalid) e.invalid_binds |= 1u;
     }
 
