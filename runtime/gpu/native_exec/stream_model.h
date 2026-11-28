@@ -5,6 +5,7 @@
 // (native_executor.h) stays behind PLAYGTA6_NATIVE_EXECUTOR. Design: docs/NATIVE_EXECUTOR_DESIGN.md.
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -203,6 +204,41 @@ inline uint32_t drop_mismatched_colors(const RenderPassPlan& plan,
         if (!(color_sizes[i] == ref)) dropped |= 1u << i;
     }
     return dropped;
+}
+
+// D3D12 renders into the intersection of attachments of different sizes (a full-size depth buffer under a
+// smaller color target, a padded depth allocation); a WebGPU pass needs one size, and the sanitizer above would
+// drop the depth-stencil attachment (or colors), so the pass loses the title's targets and the pipelines (built
+// for them) no longer match it. With a depth-stencil attachment of known size the pass takes its size (a depth
+// texture can only be copied whole), and every color attachment of another size renders into a proxy of that
+// size; the region both share is copied into the proxy before the pass (Load) and back after it (Store).
+struct AttachmentProxyPlan {
+    uint32_t proxied = 0;  // color slots rendered through a proxy
+    AttachmentSize pass;   // the pass size: the depth-stencil attachment's
+    AttachmentSize area;   // the intersection of every attachment: the render area (scissor limit)
+    std::array<AttachmentSize, kGpuMaxColorAttachments> copy{};  // per proxied slot: the region copied in / out
+};
+// `proxyable`: the color slots a proxy can stand in for (a 2D, single-sample texture). Empty when the sizes
+// agree, there is no depth-stencil attachment of known size, or a mismatched slot cannot be proxied (the
+// sanitizer then applies).
+inline std::optional<AttachmentProxyPlan> plan_attachment_proxies(
+    const RenderPassPlan& plan, const std::array<AttachmentSize, kGpuMaxColorAttachments>& color_sizes,
+    AttachmentSize depth_stencil_size, uint32_t proxyable) {
+    if (!plan.has_depth_stencil || !depth_stencil_size.known()) return std::nullopt;
+    AttachmentProxyPlan p;
+    p.pass = depth_stencil_size;
+    p.area = depth_stencil_size;
+    for (uint32_t i = 0; i < plan.color_count && i < kGpuMaxColorAttachments; ++i) {
+        if (plan.colors[i].texture_id == 0 || !color_sizes[i].known() || color_sizes[i] == depth_stencil_size)
+            continue;
+        if (!(proxyable >> i & 1u)) return std::nullopt;
+        p.proxied |= 1u << i;
+        p.copy[i] = {std::min(color_sizes[i].width, depth_stencil_size.width),
+                     std::min(color_sizes[i].height, depth_stencil_size.height)};
+        p.area = {std::min(p.area.width, p.copy[i].width), std::min(p.area.height, p.copy[i].height)};
+    }
+    if (!p.proxied) return std::nullopt;
+    return p;
 }
 
 // ---- CreateBuffer / WriteBuffer (opcodes 3, 4) ----

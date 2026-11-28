@@ -7780,6 +7780,32 @@ struct NativeExecutor::Impl {
         bool render_pass_opened = false;
         bool explicit_pass = false;       // the active render pass came from BeginRenderPass
         std::optional<AttachmentSize> explicit_size;
+        // Color attachments of another size than the pass's depth attachment render through proxies
+        // (plan_attachment_proxies): each proxy's shared region goes back to the title's texture when the pass
+        // ends (and in again when a copy ended it in between). render_area: the scissor limit (the intersection).
+        struct AttachmentProxy {
+            wgpu::Texture proxy, real;
+            uint32_t mip = 0, layer = 0, w = 0, h = 0;
+            bool store = true;
+        };
+        std::vector<AttachmentProxy> proxies;
+        bool proxy_reload = false;
+        std::optional<AttachmentSize> render_area;
+        void proxy_copy(const AttachmentProxy& p, bool out) {
+            wgpu::TexelCopyTextureInfo real{};
+            real.texture = p.real;
+            real.mipLevel = p.mip;
+            real.origin = {0, 0, p.layer};
+            wgpu::TexelCopyTextureInfo prox{};
+            prox.texture = p.proxy;
+            const wgpu::Extent3D size{p.w, p.h, 1};
+            if (out) enc.CopyTextureToTexture(&prox, &real, &size);
+            else enc.CopyTextureToTexture(&real, &prox, &size);
+        }
+        void proxies_out() {
+            for (const AttachmentProxy& p : proxies)
+                if (p.store) proxy_copy(p, true);
+        }
         bool group0_bound = false;
         uint8_t bound_groups = 0;  // groups the active pass bound (bit = group): fitted dummies skip them
         // Groups whose last SetBindGroup named an invalid bind group (bit = group): not encoded, and every
@@ -7928,6 +7954,10 @@ struct NativeExecutor::Impl {
         }
         // ... and continues in a new pass of the same kind with the same state (no timestamps).
         void resume_render() {
+            if (proxy_reload) {  // a copy between the segments may have written the title's textures
+                for (const AttachmentProxy& p : proxies) proxy_copy(p, false);
+                proxy_reload = false;
+            }
             wgpu::RenderPassDescriptor rp{};
             rp.colorAttachmentCount = cont_color_count;
             rp.colorAttachments = cont_colors.data();
@@ -8055,9 +8085,16 @@ struct NativeExecutor::Impl {
             seg_close();
             occ_seg_close();
             const bool ended = rpass || cpass;
-            if (rpass) { rpass.End(); rpass = nullptr; }
+            if (rpass) {
+                rpass.End();
+                rpass = nullptr;
+                proxies_out();
+            }
             if (cpass) { cpass.End(); cpass = nullptr; }
             if (ended) cut();
+            proxies.clear();
+            proxy_reload = false;
+            render_area.reset();
             keep_kind = 0;
             explicit_pass = false;
             group0_bound = false;
@@ -8110,6 +8147,8 @@ struct NativeExecutor::Impl {
             auto pf = pass_fmt;
             const bool ep = explicit_pass, g0 = group0_bound;
             const bool vb = variant_blocked;
+            auto px = proxies;  // their contents went to the title's textures (end_active): reloaded on resume
+            const auto ra = render_area;
             end_active();
             if (!kind) return;
             keep_kind = kind;
@@ -8134,6 +8173,9 @@ struct NativeExecutor::Impl {
                 pass_fmt = pf;
                 explicit_pass = ep;
                 variant_blocked = vb;
+                proxies = std::move(px);
+                proxy_reload = !proxies.empty();
+                render_area = ra;
             }
         }
         void ensure_render() {  // _ensurePresentRenderPass
@@ -8218,19 +8260,74 @@ struct NativeExecutor::Impl {
             sizes[i] = b.colors[i].swapchain ? AttachmentSize{stream_w, stream_h} : b.colors[i].size;
         }
         plan.has_depth_stencil = b.has_ds;
-        const uint32_t dropped = drop_mismatched_colors(plan, sizes, b.ds_size);
+        // Attachments of different sizes: proxies keep them all where they can (plan_attachment_proxies).
+        uint32_t proxyable = 0;
+        std::array<const TextureEntry*, kGpuMaxColorAttachments> reals{};
+        for (uint32_t i = 0; i < b.color_count; ++i) {
+            const ColorAtt& c = b.colors[i];
+            if (c.texture_id == 0 || c.swapchain) continue;
+            auto it = textures.find(c.texture_id);
+            if (it == textures.end()) continue;
+            const TextureEntry& t = it->second;
+            const bool copy_out_ok = c.store == StoreOp::Discard || (t.usage & 0x2u) != 0;  // CopyDst
+            if (t.geom.dimension == 1 && t.sample_count == 1 && copy_out_ok) {
+                proxyable |= 1u << i;
+                reals[i] = &t;
+            }
+        }
+        std::optional<AttachmentProxyPlan> proxy_plan = plan_attachment_proxies(plan, sizes, b.ds_size, proxyable);
+        const uint32_t dropped = proxy_plan ? 0 : drop_mismatched_colors(plan, sizes, b.ds_size);
         // sanitizeRenderPassAttachments reference size: first color with a known size, else depth.
         AttachmentSize ref{};
         for (uint32_t i = 0; i < b.color_count; ++i)
             if (b.colors[i].texture_id != 0 && sizes[i].known()) { ref = sizes[i]; break; }
         if (!ref.known() && b.has_ds) ref = b.ds_size;
+        if (proxy_plan) ref = proxy_plan->pass;
         bool drop_ds = b.has_ds && ref.known() && b.ds_size.known() && !(b.ds_size == ref);
+        if ((dropped || drop_ds || proxy_plan) && attachment_size_notes < 6) {
+            ++attachment_size_notes;
+            std::string m = "[native_exec] render pass attachments of different sizes (";
+            m += proxy_plan ? "proxied" : "dropped";
+            m += "): colors";
+            for (uint32_t i = 0; i < b.color_count; ++i)
+                m += " " + std::to_string(b.colors[i].texture_id) + ":" + std::to_string(sizes[i].width) + "x" +
+                     std::to_string(sizes[i].height) + "/" + std::to_string(b.colors[i].fmt);
+            if (b.has_ds)
+                m += "; depth " + std::to_string(b.ds.texture_id) + ":" + std::to_string(b.ds_size.width) + "x" +
+                     std::to_string(b.ds_size.height) + "/" + std::to_string(b.ds_fmt);
+            m += "; proxyable " + std::to_string(proxyable);
+            std::fprintf(stderr, "%s\n", m.c_str());
+        }
 
         std::array<wgpu::RenderPassColorAttachment, kGpuMaxColorAttachments> colors{};
         for (uint32_t i = 0; i < b.color_count; ++i) {
             const ColorAtt& c = b.colors[i];
             if (c.texture_id == 0 || (dropped & (1u << i))) {
                 if (dropped & (1u << i)) ++stats.render_pass_dropped_colors;
+                continue;
+            }
+            if (proxy_plan && (proxy_plan->proxied >> i & 1u)) {
+                const TextureEntry& t = *reals[i];
+                Encoder::AttachmentProxy px;
+                px.real = t.texture;
+                px.mip = c.base_mip;
+                px.layer = c.base_layer;
+                px.w = proxy_plan->copy[i].width;
+                px.h = proxy_plan->copy[i].height;
+                px.store = c.store != StoreOp::Discard;
+                wgpu::TextureView pv;
+                px.proxy = attachment_proxy(t.geom.format, c.fmt, i, proxy_plan->pass, &pv);
+                if (!px.proxy || !pv) {  // cannot happen for a valid view; the attachment is left out
+                    ++stats.render_pass_dropped_colors;
+                    continue;
+                }
+                if (c.load != LoadOp::Clear) e.proxy_copy(px, false);  // e has no open pass (end_active above)
+                colors[i].view = pv;
+                colors[i].loadOp = c.load == LoadOp::Clear ? wgpu::LoadOp::Clear : wgpu::LoadOp::Load;
+                colors[i].storeOp = wgpu::StoreOp::Store;
+                if (c.load == LoadOp::Clear) colors[i].clearValue = {c.clear.r, c.clear.g, c.clear.b, c.clear.a};
+                e.proxies.push_back(std::move(px));
+                ++stats.render_pass_proxied_colors;
                 continue;
             }
             if (c.swapchain) {
@@ -8288,9 +8385,60 @@ struct NativeExecutor::Impl {
         // swapchain size (swapchain target) or the static attachment size.
         if (ref.known()) e.explicit_size = ref;
         else e.explicit_size = std::nullopt;
+        if (proxy_plan && !(proxy_plan->area == proxy_plan->pass)) {
+            // D3D12 draws only inside every attachment: the scissor stays within the shared region.
+            e.render_area = proxy_plan->area;
+            const std::array<uint32_t, 4> r{0, 0, proxy_plan->area.width, proxy_plan->area.height};
+            e.rpass.SetScissorRect(r[0], r[1], r[2], r[3]);
+            e.scissor = r;
+        }
         // A new pass resets the compute filter state (_preparePassCommandsForFlush).
         e.had_explicit_compute = false;
         e.compute_valid = false;
+    }
+
+    static std::array<uint32_t, 4> clamp_to_area(std::array<uint32_t, 4> r, AttachmentSize a) {
+        r[0] = std::min(r[0], a.width);
+        r[1] = std::min(r[1], a.height);
+        r[2] = std::min(r[2], a.width - r[0]);
+        r[3] = std::min(r[3], a.height - r[1]);
+        return r;
+    }
+
+    // The proxy color texture of a slot (plan_attachment_proxies), reused across passes: the title texture's
+    // format, the pass size, the attachment view's format.
+    std::unordered_map<uint64_t, std::pair<wgpu::Texture, wgpu::TextureView>> att_proxies;
+    uint32_t attachment_size_notes = 0;
+    wgpu::Texture attachment_proxy(uint8_t format, uint8_t view_format, uint32_t slot, AttachmentSize size,
+                                   wgpu::TextureView* view) {
+        const uint64_t key = uint64_t{size.width & 0xffffu} | uint64_t{size.height & 0xffffu} << 16 |
+                             uint64_t{format} << 32 | uint64_t{view_format} << 40 | uint64_t{slot & 0xffu} << 48;
+        if (auto it = att_proxies.find(key); it != att_proxies.end()) {
+            *view = it->second.second;
+            return it->second.first;
+        }
+        if (att_proxies.size() >= 64) att_proxies.clear();
+        const wgpu::TextureFormat vf = wgpu_format(view_format ? view_format : format);
+        wgpu::TextureDescriptor td{};
+        td.usage = wgpu::TextureUsage::RenderAttachment | wgpu::TextureUsage::CopySrc | wgpu::TextureUsage::CopyDst;
+        td.dimension = wgpu::TextureDimension::e2D;
+        td.size = {size.width, size.height, 1};
+        td.format = wgpu_format(format);
+        if (vf != td.format) {
+            td.viewFormatCount = 1;
+            td.viewFormats = &vf;
+        }
+        wgpu::Texture t = device.CreateTexture(&td);
+        if (!t) return nullptr;
+        wgpu::TextureViewDescriptor vd{};
+        vd.format = vf;
+        vd.dimension = wgpu::TextureViewDimension::e2D;
+        vd.mipLevelCount = 1;
+        vd.arrayLayerCount = 1;
+        *view = t.CreateView(&vd);
+        ++stats.render_pass_proxy_textures;
+        att_proxies.emplace(key, std::make_pair(t, *view));
+        return t;
     }
 
     // The attachment state of the pass about to be encoded (attachments dropped by the sanitizer are null).
@@ -8597,8 +8745,9 @@ struct NativeExecutor::Impl {
             if (!e.rpass) return;
             const auto ts = e.target_size();
             const Rect c = clamp_scissor_to_target(sr->x, sr->y, sr->w, sr->h, ts ? ts->width : 0, ts ? ts->height : 0);
-            const std::array<uint32_t, 4> r{static_cast<uint32_t>(c.x), static_cast<uint32_t>(c.y),
-                                            static_cast<uint32_t>(c.width), static_cast<uint32_t>(c.height)};
+            std::array<uint32_t, 4> r{static_cast<uint32_t>(c.x), static_cast<uint32_t>(c.y),
+                                      static_cast<uint32_t>(c.width), static_cast<uint32_t>(c.height)};
+            if (e.render_area) r = clamp_to_area(r, *e.render_area);
             e.rpass.SetScissorRect(r[0], r[1], r[2], r[3]);
             e.scissor = r;
         } else if (const auto* bc = std::get_if<BlendConstantCmd>(&cmd)) {
@@ -11420,6 +11569,8 @@ std::string NativeExecutor::stats_json() const {
     if (st.faulted) j += "\"fault_record\": " + st.fault_record + ", ";
     num("render_pass_missing_texture", st.render_pass_missing_texture);
     num("render_pass_dropped_colors", st.render_pass_dropped_colors);
+    num("render_pass_proxied_colors", st.render_pass_proxied_colors);
+    num("render_pass_proxy_textures", st.render_pass_proxy_textures);
     num("swapchain_format_unsupported", st.swapchain_format_unsupported);
     num("blit_frames", st.blit_frames);
     num("surface_configures", st.surface_configures);

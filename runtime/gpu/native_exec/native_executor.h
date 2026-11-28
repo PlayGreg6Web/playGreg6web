@@ -249,6 +249,8 @@ struct ExecutorStats {
     uint64_t dropped_while_lost = 0;  // batches ignored after device loss
     uint64_t render_pass_missing_texture = 0;  // BeginRenderPass dropped: unknown attachment texture
     uint64_t render_pass_dropped_colors = 0;   // attachments dropped for a size mismatch
+    uint64_t render_pass_proxied_colors = 0;   // colors of another size than the depth, rendered through a proxy
+    uint64_t render_pass_proxy_textures = 0;   // proxy textures created for them
     uint64_t swapchain_format_unsupported = 0;  // stream asked for a swapchain format that is no colour format
     uint64_t blit_frames = 0;  // frames presented through the intermediate texture + blit
     uint64_t surface_configures = 0;         // surface (re)configurations (resize, format change, lost surface)

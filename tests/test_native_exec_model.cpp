@@ -178,6 +178,29 @@ void test_begin_render_pass() {
     CHECK(mip_size({64, 32}, 2) == (AttachmentSize{16, 8}));
     CHECK(mip_size({64, 32}, 6) == (AttachmentSize{1, 1}));
     CHECK(mip_size({64, 32}, 40) == (AttachmentSize{1, 1}));
+
+    // A depth-stencil attachment of another size: the pass takes the depth size and the mismatched colors
+    // render through proxies (instead of the sanitizer dropping the depth attachment).
+    RenderPassPlan q;
+    q.color_count = 2;
+    q.colors[0].texture_id = 1;
+    q.colors[1].texture_id = 2;
+    q.has_depth_stencil = true;
+    std::array<AttachmentSize, kGpuMaxColorAttachments> cs{};
+    cs[0] = {1920, 1080};
+    cs[1] = {1920, 1088};
+    auto pp = plan_attachment_proxies(q, cs, {1920, 1088}, 0b11);
+    CHECK(pp.has_value() && pp->proxied == 0b01 && pp->pass == (AttachmentSize{1920, 1088}));
+    CHECK(pp->copy[0] == (AttachmentSize{1920, 1080}) && pp->area == (AttachmentSize{1920, 1080}));
+    cs[0] = {3840, 2160};  // a color larger than the depth: the shared region is the depth's
+    pp = plan_attachment_proxies(q, cs, {1920, 1088}, 0b11);
+    CHECK(pp.has_value() && pp->copy[0] == (AttachmentSize{1920, 1088}) && pp->area == (AttachmentSize{1920, 1088}));
+    CHECK(!plan_attachment_proxies(q, cs, {1920, 1088}, 0b10).has_value());  // slot 0 cannot be proxied
+    cs[0] = {1920, 1088};
+    CHECK(!plan_attachment_proxies(q, cs, {1920, 1088}, 0b11).has_value());  // sizes agree
+    q.has_depth_stencil = false;
+    cs[0] = {64, 64};
+    CHECK(!plan_attachment_proxies(q, cs, {}, 0b11).has_value());  // no depth: the sanitizer decides
 }
 
 void test_write_buffer() {
