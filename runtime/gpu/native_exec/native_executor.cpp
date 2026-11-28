@@ -5304,7 +5304,10 @@ struct NativeExecutor::Impl {
         if (f.fit == RangeFit::Unfixable) ++stats.view_range_unfixable;
         if (f.mips_clamped) ++stats.view_mips_clamped;
         if (f.layers_clamped) ++stats.view_layers_clamped;
-        if (stats.view_range_unfixable + stats.view_mips_clamped + stats.view_layers_clamped <= 16)
+        const uint64_t nth = f.fit == RangeFit::Unfixable ? stats.view_range_unfixable
+                             : f.layers_clamped           ? stats.view_layers_clamped
+                                                          : stats.view_mips_clamped;
+        if (nth <= 8)  // the first of each kind (mip cuts are common and would hide the layer cases)
             std::fprintf(stderr,
                          "[native-exec] %s range %s: tex dim=%u %ux%u layers=%u mips=%u fmt=%u; view dim=%u mips %u+%u "
                          "layers %u+%u\n",
