@@ -968,9 +968,11 @@ pub fn discover_refined_rounds(
     timings: &mut DiscoveryTimings,
 ) -> (Analysis, CodePointerOutcome) {
     let stage_start = Instant::now();
-    let result = refined_rounds(image, guest, max_rounds, continue_rounds, timings);
+    let (mut analysis, outcome) =
+        refined_rounds(image, guest, max_rounds, continue_rounds, timings);
+    crate::pointer_slot::resolve_slot_stores(image, &mut analysis);
     timings.total += stage_start.elapsed();
-    result
+    (analysis, outcome)
 }
 
 fn refined_rounds(
