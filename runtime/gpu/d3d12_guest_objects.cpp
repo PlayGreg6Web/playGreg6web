@@ -487,6 +487,23 @@ void Device::submit(const uint8_t* data, size_t size) {
     submit_parts({{data, size}});
 }
 
+void Device::submit_with_next(const CommandEncoder& encoder) {
+    if (encoder.size() == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(next_submission_mutex_);
+    next_submission_.insert(next_submission_.end(), encoder.data(), encoder.data() + encoder.size());
+}
+
+void Device::emit_next_submission_locked() {
+    std::vector<uint8_t> next;
+    {
+        std::lock_guard<std::mutex> lock(next_submission_mutex_);
+        next.swap(next_submission_);
+    }
+    emit_locked(next.data(), next.size());
+}
+
 void Device::submit_parts(const std::vector<std::pair<const uint8_t*, size_t>>& parts) {
     os::lock_with_span(submit_mutex_, os::SpanKind::D3dLock);
     std::lock_guard<std::mutex> lock(submit_mutex_, std::adopt_lock);
@@ -496,6 +513,7 @@ void Device::submit_parts(const std::vector<std::pair<const uint8_t*, size_t>>& 
         write_sink_locked(begin.data(), begin.size());
         frame_open_ = true;
     }
+    emit_next_submission_locked();
     for (const auto& [data, size] : parts) {
         emit_locked(data, size);
     }
@@ -1330,6 +1348,7 @@ uint32_t Device::present(std::span<const uint32_t> plane_textures) {
         begin.begin_frame();
     }
     write_sink_locked(begin.data(), begin.size());
+    emit_next_submission_locked();
     emit_locked(enc.data(), enc.size());
     frame_open_ = false;
     const uint64_t presented = presents_.fetch_add(1, std::memory_order_relaxed) + 1;

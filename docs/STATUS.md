@@ -170,6 +170,9 @@ Runtime pieces are merged (residency of BVH/address sources, fault readback, WGS
 - Native live window: about 55 to 60 fps in the menus.
 - Native headless: about 58 fps (soak p50 58.8).
 - The GPU buffer flush costs about 4.5 ms/frame (was 9.0, #1970); `frame_breakdown` shows where the rest goes.
+- Intro after the menus (100 to 999 draws per frame): about 1 fps, 1.04 s per frame (was 1.22 s): the guest's
+  submitting threads wait on the live executor (pump about 590 ms per frame, read-back flushes included) and on
+  storage-relocation locks. `--profile-guest` also samples the pump thread (thread_id 4294901761).
 - Rough, scene-dependent figures; refresh them from a boot report (`gpu_time_top.py`, `[live]` lines, window title).
 
 ## Diagnostic tools

@@ -1150,6 +1150,13 @@ public:
     void submit(const CommandEncoder& encoder) { submit(encoder.data(), encoder.size()); }
     // Several byte ranges as one submission (no other submission in between).
     void submit_parts(const std::vector<std::pair<const uint8_t*, size_t>>& parts);
+    // Queues `encoder`'s packets for the start of the next submission (submit_parts / present) instead of
+    // writing them now: never blocks on the sink (the live pump's backpressure), so it may be called
+    // with a device lock held. Every submission that can reference what the packets create or write
+    // (a command list binding a new storage home) is emitted after them.
+    void submit_with_next(const CommandEncoder& encoder);
+    // presents_ without stats()'s bounded wait for the submit lock (hot paths).
+    uint64_t presents() const { return presents_.load(std::memory_order_relaxed); }
     // Present packet (and BeginFrame before the next frame's first submission). `plane_textures`
     // (PresentX planes, plane 0 on top; 0 = no texture) are first drawn into the canvas texture
     // (kGpuSwapchainTextureId) by one pass, each scaled to the full canvas: the last drawable plane
@@ -1221,6 +1228,11 @@ private:
     bool frame_open_ = false;
     std::atomic<uint64_t> presents_{0};     // written under submit_mutex_, read lock-free by stats()
     std::atomic<uint64_t> submissions_{0};  // written under submit_mutex_, read lock-free by stats()
+    // submit_with_next: packets for the start of the next submission. A leaf lock (taken under
+    // submit_mutex_ or a device lock, never the other way round).
+    std::mutex next_submission_mutex_;
+    std::vector<uint8_t> next_submission_;
+    void emit_next_submission_locked();  // with submit_mutex_ held
     // Present composition objects (under submit_mutex_), created on first use (PresentBlitCache).
     uint32_t emit_present_planes(std::span<const uint32_t> plane_textures, CommandEncoder& enc);
     PresentBlitCache present_blit_;

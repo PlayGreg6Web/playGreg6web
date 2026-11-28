@@ -5629,6 +5629,7 @@ void test_g51_slot70_unaligned_buffer_views() {
     const size_t mark_a = fx.captured.size();
     fx.vcall(scene.device, XSlot::SrvAtAddress,
              {I(put(buffer_desc(192))), I(put_bytes(srv48, sizeof(srv48))), I(cpu0)});
+    dev->submit(gpu::CommandEncoder{});  // a relocation's upload goes out with the next submission
     const auto pkts_a = packets_since(fx, mark_a);
 
     CHECK(dev->stats().bad_arguments == bad_before);
@@ -5674,6 +5675,7 @@ void test_g51_slot70_unaligned_buffer_views() {
     const size_t mark_b = fx.captured.size();
     fx.vcall(scene.device, XSlot::SrvAtAddress,
              {I(put(buffer_desc(256))), I(put_bytes(srv64, sizeof(srv64))), I(cpu0 + 32)});
+    dev->submit(gpu::CommandEncoder{});  // a relocation's upload goes out with the next submission
     const auto pkts_b = packets_since(fx, mark_b);
 
     CHECK(dev->stats().bad_arguments == bad_before);
@@ -5798,6 +5800,7 @@ void test_g51_slot70_address_only_buffer_view() {
     const size_t mark = fx.captured.size();
     fx.vcall(scene.device, XSlot::SrvAtAddress,
              {I(put(buffer_desc(256))), I(put_bytes(srv, sizeof(srv))), I(cpu0)});
+    dev->submit(gpu::CommandEncoder{});  // a relocation's upload goes out with the next submission
     const auto pkts = packets_since(fx, mark);
 
     CHECK(dev->stats().bad_arguments == bad_before);
@@ -6291,6 +6294,78 @@ void test_g55_root_sig_layout_caps() {
     CHECK(find_op(exec_pkts, GpuOpcode::DispatchCompute) != nullptr);
     CHECK(t_balanced);
     scene.release_all({list, cpso, srv_heap, big_rs, blob});
+}
+
+// A new storage relocation home's upload never goes to the sink from inside relocate_storage_buffer
+// (which holds storage_relocation_mutex_: a sink blocked by the live pump's backpressure stalled every
+// thread binding a storage range behind it). It is queued and written at the start of the next
+// submission, before that submission's own packets, as one write; a hit queues nothing.
+void test_storage_relocation_upload_goes_with_next_submission() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    std::vector<uint8_t> bytes(512);
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        bytes[i] = static_cast<uint8_t>(i * 3u + 11u);
+    }
+    const uint64_t va = put_aligned(bytes, 256) + 0x40;  // unaligned: a relocated range
+    const auto write_to = [](const std::vector<std::vector<uint8_t>>& batches, size_t from, uint32_t id,
+                             uint64_t offset, std::vector<uint8_t>* data, size_t* batch) {
+        for (size_t b = from; b < batches.size(); ++b) {
+            const std::vector<uint8_t>& c = batches[b];
+            size_t off = 0;
+            while (off + sizeof(GpuPacketHeader) <= c.size()) {
+                GpuPacketHeader h{};
+                std::memcpy(&h, c.data() + off, sizeof(h));
+                const size_t body = off + sizeof(h);
+                if (static_cast<GpuOpcode>(h.opcode) == GpuOpcode::WriteBuffer && h.payload_bytes >= sizeof(GpuWriteBufferPayload)) {
+                    GpuWriteBufferPayload w{};
+                    std::memcpy(&w, c.data() + body, sizeof(w));
+                    if (w.id == id && w.dst_offset == offset) {
+                        data->assign(c.data() + body + sizeof(w), c.data() + body + sizeof(w) + w.data_len);
+                        *batch = b;
+                        return true;
+                    }
+                }
+                off = body + h.payload_bytes;
+            }
+        }
+        return false;
+    };
+    const size_t before = fx.captured.size();
+    const uint64_t uploads0 = dg::work_total(dg::Work::BufferUploads);
+    uint32_t id = 0;
+    uint64_t offset = 0;
+    CHECK(dev->relocate_storage_buffer(va, 200, &id, &offset, false));
+    CHECK(dg::work_total(dg::Work::BufferUploads) == uploads0 + 1);
+    CHECK(fx.captured.size() == before);  // nothing written from inside the relocation
+    std::vector<uint8_t> got;
+    size_t batch = 0;
+    gpu::CommandEncoder marker;
+    marker.present();
+    const size_t submit_at = fx.captured.size();
+    dev->submit(marker);
+    CHECK(write_to(fx.captured, submit_at, id, static_cast<uint32_t>(offset), &got, &batch));
+    CHECK(got.size() >= 200 && std::equal(got.begin(), got.begin() + 200, bytes.begin() + 0x40));
+    // The queued upload precedes the submission's own packets (the marker is in a later batch).
+    bool marker_after = false;
+    for (size_t b = batch + 1; b < fx.captured.size() && !marker_after; ++b) {
+        GpuPacketHeader h{};
+        if (fx.captured[b].size() >= sizeof(h)) {
+            std::memcpy(&h, fx.captured[b].data(), sizeof(h));
+            marker_after = static_cast<GpuOpcode>(h.opcode) == GpuOpcode::Present;
+        }
+    }
+    CHECK(marker_after);
+    // A hit: the same home, nothing queued for the next submission.
+    uint32_t id2 = 0;
+    uint64_t offset2 = 0;
+    CHECK(dev->relocate_storage_buffer(va, 200, &id2, &offset2, false));
+    CHECK(id2 == id && offset2 == offset);
+    const size_t again = fx.captured.size();
+    dev->submit(marker);
+    CHECK(!write_to(fx.captured, again, id, static_cast<uint32_t>(offset), &got, &batch));
+    scene.release_all();
 }
 
 // G58: the title's 2D/UI draws bind dynamic ring buffers in guest RAM by address only (no
@@ -10505,6 +10580,7 @@ int main() {
     test_g55_root_sig_layout_caps();
     test_g58_relocate_ia_vb_ib();
     test_storage_relocation_reuse_waits_for_presents();
+    test_storage_relocation_upload_goes_with_next_submission();
     test_storage_relocation_keeps_large_frame_working_set();
     test_storage_relocation_evicted_chunks_are_released();
     test_g84_readback_ring_hardening();
