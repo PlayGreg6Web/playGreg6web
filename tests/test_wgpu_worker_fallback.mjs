@@ -808,6 +808,7 @@ test('G28 createWgpuWorkerHandler init preloads shaderPackUrl and reflectionMani
 
   assert.deepEqual(fetchedUrls.sort(), [
     '/shaders/fallback.wgsl.pack',
+    '/shaders/fallback.wgsl.pack.interstage.json',
     '/shaders/reflection-manifest.json',
   ]);
   assert.equal(readySawLoadedPack, true, 'shaderPackUrl must be loaded before ready message');

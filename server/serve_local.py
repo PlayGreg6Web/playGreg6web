@@ -70,6 +70,11 @@ DEFAULT_FILE_HANDLE_CACHE_SIZE = 32
 DEFAULT_CONCURRENT_FD_POOL_SIZE = 8  # Concurrent read-only FDs per cached file on non-pread OSes
 DEFAULT_MAX_TOTAL_OPEN_FDS = 256  # Global open FD budget across all cached entries
 DEFAULT_RESOLVED_PATH_CACHE_SIZE = 512  # Bounded LRU cache for verified non-symlink resolved paths
+DEFAULT_INTERSTAGE_CACHE_SIZE = 16  # Bounded LRU cache for dynamically extracted .interstage.json bytes
+INTERSTAGE_SIDECAR_SUFFIX = ".interstage.json"
+REFLECT_SIDECAR_SUFFIX = ".reflect.json"
+STAGE_REFLECTION_SCHEMA = "playgta6-stage-reflection"
+STAGE_REFLECTION_INTERSTAGE_VERSION = 3
 RUNTIME_WASM_NAME = "runtime.wasm"
 PREFERRED_SHADER_PACK_NAMES = ("splash.wgsl.pack", "fallback.wgsl.pack")
 SAFE_SIDE_MODULE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$", re.IGNORECASE)
@@ -188,6 +193,166 @@ def safe_resolve(
     except (OSError, ValueError):
         return None
     return candidate
+
+
+def _is_u32_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 0xFFFFFFFF
+
+
+def _normalize_interstage_params(raw_params: Any) -> list[dict[str, int]] | None:
+    """Validate and normalize FSSM `vs_outputs` / `ps_inputs` arrays (#2085)."""
+    if not isinstance(raw_params, list):
+        return None
+    normalized: list[dict[str, int]] = []
+    for item in raw_params:
+        if not isinstance(item, dict):
+            return None
+        semantic_reg = item.get("semantic_reg")
+        location = item.get("location")
+        if not (_is_u32_int(semantic_reg) and semantic_reg <= 0xFF and _is_u32_int(location)):
+            return None
+        rec: dict[str, int] = {
+            "semantic_reg": semantic_reg,
+            "location": location,
+        }
+        if "mask" in item and item["mask"] is not None:
+            mask = item["mask"]
+            if not (_is_u32_int(mask) and mask <= 0x0F):
+                return None
+            rec["mask"] = mask
+        normalized.append(rec)
+    return normalized
+
+
+def extract_interstage_sidecar_bytes(reflect_path: Path) -> bytes:
+    """Extract a compact `playgta6-stage-reflection` v3 interstage JSON from a `.reflect.json` file.
+
+    Retains only stages with non-empty `vs_outputs` (vertex) or `ps_inputs` (fragment) so the
+    browser GPU worker can fetch ~20-40 KiB instead of parsing an 80+ MiB full sidecar.
+    """
+    with reflect_path.open(encoding="utf-8-sig") as f:
+        doc = json.load(f)
+    if not isinstance(doc, dict) or doc.get("schema") != STAGE_REFLECTION_SCHEMA:
+        raise ValueError("invalid stage reflection sidecar schema")
+    stages = doc.get("stages")
+    if not isinstance(stages, dict):
+        raise ValueError("stage reflection sidecar 'stages' must be an object")
+
+    compact_stages: dict[str, Any] = {}
+    for key, stage_obj in stages.items():
+        if not isinstance(key, str) or not key or not isinstance(stage_obj, dict):
+            continue
+        raw_stage = stage_obj.get("stage")
+        stage = {"vertex": "vertex", "fragment": "fragment", "pixel": "fragment"}.get(
+            str(raw_stage)
+        )
+        if stage == "vertex":
+            raw_vs = stage_obj.get("vs_outputs")
+            if raw_vs is None:
+                continue
+            vs_outputs = _normalize_interstage_params(raw_vs)
+            if vs_outputs:
+                compact_stages[key] = {
+                    "stage": "vertex",
+                    "bindings": [],
+                    "vs_outputs": vs_outputs,
+                }
+        elif stage == "fragment":
+            raw_ps = stage_obj.get("ps_inputs")
+            if raw_ps is None:
+                continue
+            ps_inputs = _normalize_interstage_params(raw_ps)
+            if ps_inputs:
+                compact_stages[key] = {
+                    "stage": "fragment",
+                    "bindings": [],
+                    "ps_inputs": ps_inputs,
+                }
+
+    payload = {
+        "schema": STAGE_REFLECTION_SCHEMA,
+        "version": STAGE_REFLECTION_INTERSTAGE_VERSION,
+        "stages": compact_stages,
+    }
+    return json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+
+class _InterstageSidecarCache:
+    """Thread-safe bounded LRU cache for dynamically extracted `.interstage.json` UTF-8 bytes.
+
+    Keyed by `(realpath, mtime_ns, size)` so edits to `<name>.reflect.json` automatically
+    invalidate cached bytes, with per-key coalescing to avoid redundant parses of 80+ MiB files.
+    """
+
+    def __init__(self, max_entries: int = DEFAULT_INTERSTAGE_CACHE_SIZE) -> None:
+        self._max_entries = max(0, max_entries)
+        self._lock = threading.Lock()
+        self._entries: OrderedDict[tuple[str, int, int], bytes] = OrderedDict()
+        self._inflight: dict[tuple[str, int, int], threading.Event] = {}
+        self._hits = 0
+        self._misses = 0
+
+    def get_or_build(
+        self,
+        reflect_path: Path,
+        st: os.stat_result,
+        *,
+        realpath: str | None = None,
+    ) -> bytes:
+        resolved_key_path = realpath if realpath is not None else os.path.realpath(reflect_path)
+        cache_key = (resolved_key_path, st.st_mtime_ns, st.st_size)
+        if self._max_entries <= 0:
+            return extract_interstage_sidecar_bytes(reflect_path)
+
+        while True:
+            with self._lock:
+                cached = self._entries.get(cache_key)
+                if cached is not None:
+                    self._entries.move_to_end(cache_key)
+                    self._hits += 1
+                    return cached
+                inflight_ev = self._inflight.get(cache_key)
+                if inflight_ev is None:
+                    inflight_ev = threading.Event()
+                    self._inflight[cache_key] = inflight_ev
+                    is_builder = True
+                    break
+                is_builder = False
+            if not is_builder:
+                inflight_ev.wait()
+
+        try:
+            data = extract_interstage_sidecar_bytes(reflect_path)
+        except Exception:
+            with self._lock:
+                self._inflight.pop(cache_key, None)
+                inflight_ev.set()
+            raise
+
+        with self._lock:
+            self._misses += 1
+            self._entries[cache_key] = data
+            self._entries.move_to_end(cache_key)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+            self._inflight.pop(cache_key, None)
+            inflight_ev.set()
+        return data
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "entries": len(self._entries),
+                "hits": self._hits,
+                "misses": self._misses,
+            }
+
+
+_DEFAULT_INTERSTAGE_SIDECAR_CACHE = _InterstageSidecarCache()
 
 
 class _ResolvedPathCache:
@@ -1939,6 +2104,97 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         server = getattr(self, "server", None)
         return getattr(server, "resolved_path_cache", None) if server is not None else None
 
+    def _get_interstage_sidecar_cache(self) -> _InterstageSidecarCache:
+        cache = getattr(self, "interstage_sidecar_cache", None)
+        if cache is not None:
+            return cache
+        server = getattr(self, "server", None)
+        server_cache = getattr(server, "interstage_sidecar_cache", None) if server is not None else None
+        return server_cache if server_cache is not None else _DEFAULT_INTERSTAGE_SIDECAR_CACHE
+
+    def _try_serve_dynamic_interstage(self, url_path: str, send_body: bool) -> bool:
+        """Dynamically extract and serve `/shaders/<name>.interstage.json` from `<name>.reflect.json`.
+
+        Called only when no static `<name>.interstage.json` exists on disk. Returns True if a
+        response was sent, False to fall through to a normal 404.
+        """
+        if not url_path.startswith("/shaders/") or self.shaders_root is None:
+            return False
+        rel = url_path[len("/shaders/") :]
+        normalized = _normalize_safe_relpath(rel)
+        if normalized is None or not normalized.lower().endswith(INTERSTAGE_SIDECAR_SUFFIX):
+            return False
+        stem = normalized[: -len(INTERSTAGE_SIDECAR_SUFFIX)]
+        if not stem or stem.endswith("/"):
+            return False
+        reflect_rel = f"{stem}{REFLECT_SIDECAR_SUFFIX}"
+        reflect_path = safe_resolve(
+            self.shaders_root,
+            reflect_rel,
+            root_resolved=getattr(self, "_shaders_root_resolved", None),
+        )
+        if reflect_path is None:
+            return False
+        try:
+            st = reflect_path.stat()
+        except OSError:
+            return False
+        if not stat.S_ISREG(st.st_mode):
+            return False
+
+        cache = self._get_interstage_sidecar_cache()
+        try:
+            body = cache.get_or_build(reflect_path, st, realpath=str(reflect_path))
+        except (OSError, ValueError):
+            return False
+
+        etag = f'"interstage-{st.st_size:x}-{st.st_mtime_ns:x}"'
+        last_modified = _format_mtime_http_date(st.st_mtime)
+        if_match = self._get_combined_header("If-Match")
+        if if_match is not None and not etag_matches_if_match(if_match, etag):
+            self._send_precondition_failed(etag, last_modified)
+            return True
+        if_none_match = self._get_combined_header("If-None-Match")
+        if if_none_match and etag_matches_if_none_match(if_none_match, etag):
+            self._send_not_modified(etag, last_modified)
+            return True
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("ETag", etag)
+        self.send_header("Last-Modified", last_modified)
+        self.send_header("Cache-Control", "no-cache")
+        if not send_body:
+            self.end_headers()
+            return True
+        if hasattr(self.wfile, "_sock"):
+            header_bytes = self._finish_headers_buffered()
+            self._headers_sent = True
+            try:
+                self.wfile.write(header_bytes + body)
+            except OSError as exc:
+                self.close_connection = True
+                if _is_client_disconnect_error(exc):
+                    return True
+                raise
+            except Exception:
+                self.close_connection = True
+                raise
+            return True
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError as exc:
+            self.close_connection = True
+            if _is_client_disconnect_error(exc):
+                return True
+            raise
+        except Exception:
+            self.close_connection = True
+            raise
+        return True
+
     def _classify_route(
         self, url_path: str
     ) -> tuple[str, Path, Path | None, str, bool] | None:
@@ -2349,6 +2605,8 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
                     path_cache.invalidate(path_cache_key)
                 if cache is not None and isinstance(target, Path):
                     cache.invalidate(target, realpath=target_realpath)
+                if self._try_serve_dynamic_interstage(url_path, send_body):
+                    return
                 self._send_empty(HTTPStatus.NOT_FOUND)
                 return
 
@@ -2358,6 +2616,8 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
             except OSError:
                 if cache is not None and isinstance(target, Path):
                     cache.invalidate(target, realpath=target_realpath)
+                if self._try_serve_dynamic_interstage(url_path, send_body):
+                    return
                 self._send_empty(HTTPStatus.NOT_FOUND)
                 return
 
@@ -2888,6 +3148,9 @@ class QuietThreadingHTTPServer(ThreadingHTTPServer):
             if resolved_path_cache_size > 0
             else None
         )
+        self.interstage_sidecar_cache: _InterstageSidecarCache = _InterstageSidecarCache(
+            max_entries=DEFAULT_INTERSTAGE_CACHE_SIZE
+        )
         super().__init__(
             server_address,
             RequestHandlerClass,
@@ -2901,6 +3164,9 @@ class QuietThreadingHTTPServer(ThreadingHTTPServer):
         path_cache = getattr(self, "resolved_path_cache", None)
         if path_cache is not None:
             path_cache.clear()
+        interstage_cache = getattr(self, "interstage_sidecar_cache", None)
+        if interstage_cache is not None:
+            interstage_cache.clear()
         super().server_close()
 
     def handle_error(self, request: Any, client_address: Any) -> None:

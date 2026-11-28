@@ -663,7 +663,10 @@ test('#2191 dual-mode WGSL pack selection picks subgroups pack when supported an
         wgslSubgroupsPackUrl: subgroupsUrl,
       });
     });
-    assert.deepEqual(fetchedUrls, [subgroupsUrl]);
+    assert.deepEqual(
+      fetchedUrls.filter((u) => u.endsWith('.wgsl.pack')),
+      [subgroupsUrl]
+    );
     assert.equal(handler.processor.wgslPackCache.getShaderSource(hash), subWgsl);
     handler.processor.destroy();
   }

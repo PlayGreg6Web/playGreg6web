@@ -2734,6 +2734,138 @@ class V3SchemaAndGapBreakdownTests(unittest.TestCase):
             self.assertEqual(bad_doc["stages"], {}, bad_entry)
             self.assertEqual(bad_skipped, {expected_reason: 1}, bad_entry)
 
+    def test_build_interstage_sidecar_and_cli_flags(self):
+        vs_fssm = {
+            "hash_fnv1a64": "0x5fe7a88d9cb680b3",
+            "stage": "vertex",
+            "bindings": [
+                {"group": 0, "binding": 0, "kind": "uniform",
+                 "source": {"user_sgpr": 8, "table_byte_offset": 0}},
+            ],
+            "binding_summary": {"vertex_input_mode": "attributes"},
+            "vertex_inputs": [
+                {"location": 0, "vb_slot": 0, "byte_offset": 0, "components": 3, "component_type": "f32"},
+            ],
+            "vs_outputs": [
+                {"semantic_reg": 1, "location": 0},
+                {"semantic_reg": 2, "location": 1},
+            ],
+        }
+        ps_fssm = {
+            "hash_fnv1a64": "0x56214b8d3b10a108",
+            "stage": "fragment",
+            "bindings": [
+                {"group": 0, "binding": 0, "kind": "texture",
+                 "source": {"user_sgpr": 8, "table_byte_offset": 0}},
+                {"group": 0, "binding": 1, "kind": "sampler",
+                 "source": {"static_sampler": 0}},
+            ],
+            "ps_inputs": [
+                {"semantic_reg": 1, "location": 0, "mask": 0},
+                {"semantic_reg": 2, "location": 0, "mask": 3},
+            ],
+        }
+        ps_empty = {
+            "hash_fnv1a64": "0x000000000000bb02",
+            "stage": "fragment",
+            "bindings": [
+                {"group": 0, "binding": 0, "kind": "sampler", "source": {"static_sampler": 0}},
+            ],
+            "ps_inputs": [],
+        }
+        cs_mesh = {
+            "hash_fnv1a64": "0x000000000000cc03",
+            "stage": "compute",
+            "bindings": [
+                {"group": 0, "binding": 0, "kind": "storage",
+                 "source": {"user_sgpr": 4, "table_byte_offset": 0}},
+            ],
+            "mesh_output": {"max_vertices": 64, "max_primitives": 64, "vertex_words": 8},
+        }
+        full_doc, skipped = sidecar.build([{"entries": [vertex_entry(True), vs_fssm, ps_fssm, ps_empty, cs_mesh]}])
+        self.assertEqual(skipped, {})
+        self.assertEqual(len(full_doc["stages"]), 5)
+
+        compact = sidecar.build_interstage_sidecar(full_doc)
+        self.assertEqual(compact["schema"], "playgta6-stage-reflection")
+        self.assertEqual(compact["version"], 3)
+        self.assertEqual(
+            compact["stages"],
+            {
+                "0x5fe7a88d9cb680b3": {
+                    "stage": "vertex",
+                    "bindings": [],
+                    "vs_outputs": [
+                        {"semantic_reg": 1, "location": 0},
+                        {"semantic_reg": 2, "location": 1},
+                    ],
+                },
+                "0x56214b8d3b10a108": {
+                    "stage": "fragment",
+                    "bindings": [],
+                    "ps_inputs": [
+                        {"semantic_reg": 1, "location": 0, "mask": 0},
+                        {"semantic_reg": 2, "location": 0, "mask": 3},
+                    ],
+                },
+            },
+        )
+
+        # Path derivation helper
+        self.assertEqual(
+            sidecar.default_interstage_path(Path("splash.wgsl.pack.reflect.json")),
+            Path("splash.wgsl.pack.interstage.json"),
+        )
+        self.assertEqual(
+            sidecar.default_interstage_path(Path("custom.json")),
+            Path("custom.interstage.json"),
+        )
+        self.assertEqual(
+            sidecar.default_interstage_path(Path("splash.wgsl.pack")),
+            Path("splash.wgsl.pack.interstage.json"),
+        )
+
+        # CLI: --emit-interstage, --interstage-out, and extracting directly from existing --out without inputs
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "pack.json"
+            out = Path(tmp) / "splash.wgsl.pack.reflect.json"
+            sibling = Path(tmp) / "splash.wgsl.pack.interstage.json"
+            custom = Path(tmp) / "custom_interstage.json"
+            src.write_text(
+                json.dumps({"entries": [vertex_entry(True), vs_fssm, ps_fssm, ps_empty, cs_mesh]}),
+                encoding="utf-8",
+            )
+
+            # Without interstage flags, sibling must NOT be created
+            self.assertEqual(sidecar.main([str(src), "--out", str(out)]), 0)
+            self.assertTrue(out.exists())
+            self.assertFalse(sibling.exists())
+
+            # With --emit-interstage + --json
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = sidecar.main([str(src), "--out", str(out), "--emit-interstage", "--json"])
+            self.assertEqual(rc, 0)
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(summary["interstage_stages_written"], 2)
+            self.assertTrue(sibling.exists())
+            self.assertEqual(json.loads(sibling.read_text(encoding="utf-8")), compact)
+
+            # With --interstage-out directly from existing --out (no inputs required)
+            stdout2 = io.StringIO()
+            with redirect_stdout(stdout2):
+                rc2 = sidecar.main(["--out", str(out), "--interstage-out", str(custom), "--json"])
+            self.assertEqual(rc2, 0)
+            summary2 = json.loads(stdout2.getvalue())
+            self.assertEqual(summary2["stages_written"], 0)
+            self.assertEqual(summary2["interstage_stages_written"], 2)
+            self.assertEqual(json.loads(custom.read_text(encoding="utf-8")), compact)
+
+        with self.assertRaises(ValueError):
+            sidecar.build_interstage_sidecar({"schema": "wrong", "stages": {}})
+        with self.assertRaises(ValueError):
+            sidecar.build_interstage_sidecar({"schema": "playgta6-stage-reflection", "stages": []})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1224,6 +1224,72 @@ def _unresolved_count(stage_obj: Any) -> int:
     return sum(1 for b in bindings if isinstance(b, dict) and is_unresolved_source(b.get("source")))
 
 
+def default_interstage_path(out_path: Path) -> Path:
+    """Derive `<pack>.interstage.json` sibling path from `<pack>.reflect.json` (or `<out>`)."""
+    name = out_path.name
+    lower = name.lower()
+    if lower.endswith(".reflect.json"):
+        stem = name[: -len(".reflect.json")]
+    elif lower.endswith(".json"):
+        stem = name[: -len(".json")]
+    else:
+        stem = name
+    return out_path.with_name(f"{stem}.interstage.json")
+
+
+def build_interstage_sidecar(sidecar_doc: dict[str, Any]) -> dict[str, Any]:
+    """Extract a compact `playgta6-stage-reflection` v3 document with only FSSM interstage stages.
+
+    Keeps only vertex stages with non-empty `vs_outputs` and fragment stages with non-empty
+    `ps_inputs`, stripping bindings/sources/vertex_inputs so workers can load ~20-40 KiB
+    instead of parsing an 80+ MiB full `.reflect.json` sidecar (#2085).
+    """
+    if not isinstance(sidecar_doc, dict):
+        raise ValueError("sidecar_doc must be a dict")
+    if "schema" in sidecar_doc and sidecar_doc["schema"] != SCHEMA:
+        raise ValueError(
+            f"sidecar_doc schema must be {SCHEMA!r}, "
+            f"got {_sanitize_label(sidecar_doc.get('schema'), fallback='<invalid>')!r}"
+        )
+    stages = sidecar_doc.get("stages")
+    if not isinstance(stages, dict):
+        raise ValueError("sidecar_doc 'stages' must be an object")
+
+    compact_stages: dict[str, Any] = {}
+    for key, stage_obj in stages.items():
+        if not isinstance(key, str) or not key or not isinstance(stage_obj, dict):
+            continue
+        stage = stage_name(str(stage_obj.get("stage", "")))
+        if stage == "vertex":
+            raw_vs = stage_obj.get("vs_outputs")
+            if raw_vs is None:
+                continue
+            vs_outputs = _normalize_stage_params(raw_vs)
+            if vs_outputs:
+                compact_stages[key] = {
+                    "stage": "vertex",
+                    "bindings": [],
+                    "vs_outputs": vs_outputs,
+                }
+        elif stage == "fragment":
+            raw_ps = stage_obj.get("ps_inputs")
+            if raw_ps is None:
+                continue
+            ps_inputs = _normalize_stage_params(raw_ps)
+            if ps_inputs:
+                compact_stages[key] = {
+                    "stage": "fragment",
+                    "bindings": [],
+                    "ps_inputs": ps_inputs,
+                }
+
+    return {
+        "schema": SCHEMA,
+        "version": VERSION_UNRESOLVED,
+        "stages": compact_stages,
+    }
+
+
 def build(
     docs: list[Any],
     existing_stages: dict[str, Any] | None = None,
@@ -1406,10 +1472,29 @@ def main(argv: list[str] | None = None) -> int:
         help="keep stages whose read-only bindings have no source, marking those {\"unresolved\": true} "
         "(sidecar version 3; the runtime binds the worker's default for them)",
     )
+    parser.add_argument(
+        "--interstage-out",
+        type=Path,
+        default=None,
+        help="write a compact playgta6-stage-reflection v3 sidecar containing only stages with "
+        "non-empty vs_outputs or ps_inputs (<pack>.interstage.json)",
+    )
+    parser.add_argument(
+        "--emit-interstage",
+        action="store_true",
+        help="also emit a sibling <pack>.interstage.json alongside --out containing only stages "
+        "with non-empty vs_outputs or ps_inputs",
+    )
     parser.add_argument("--json", action="store_true", help="print the counts as JSON")
     args = parser.parse_args(argv)
 
-    if not args.inputs and args.verify_pack is None:
+    interstage_target: Path | None = (
+        args.interstage_out
+        if args.interstage_out is not None
+        else (default_interstage_path(args.out) if args.emit_interstage else None)
+    )
+
+    if not args.inputs and args.verify_pack is None and interstage_target is None:
         parser.error("the following arguments are required: inputs")
 
     if not args.inputs and (args.merge_existing is not None or args.report_missing_sources is not None):
@@ -1514,12 +1599,24 @@ def main(argv: list[str] | None = None) -> int:
         skipped = {}
         stages_written = 0
 
+    interstage_stages_written: int | None = None
+    if interstage_target is not None:
+        interstage_doc = build_interstage_sidecar(sidecar)
+        interstage_target.parent.mkdir(parents=True, exist_ok=True)
+        interstage_target.write_text(
+            json.dumps(interstage_doc, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        interstage_stages_written = len(interstage_doc["stages"])
+
     stage_summary = summarize_stages(sidecar["stages"])
     counts: dict[str, Any] = {
         "sidecar_version": sidecar["version"],
         "stages_written": stages_written,
         "skipped": skipped,
     }
+    if interstage_stages_written is not None:
+        counts["interstage_stages_written"] = interstage_stages_written
     if args.merge_existing is not None:
         counts["merged_existing"] = len(existing_stages)
     counts.update(stage_summary)
@@ -1577,6 +1674,8 @@ def main(argv: list[str] | None = None) -> int:
                 f"[WGPK v{pack_verification['pack_version']}, {pack_verification['pack_bytes']} B, "
                 f"{pack_verification['toc_entry_bytes']} B/entry]"
             )
+        if interstage_stages_written is not None:
+            line += f"; interstage: {interstage_stages_written} stage(s)"
         gap_text = _format_gap_summary_text(gap_breakdown)
         if gap_text:
             line += f"; gaps: {gap_text}"
