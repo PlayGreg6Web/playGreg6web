@@ -277,6 +277,8 @@ const MAX_ZERO_ALLOC_RING_DRAIN_BATCHES = 64;
 const DEFAULT_MAX_WGSL_COMPILE_BYTES = 256 * 1024;
 const DEFAULT_MAX_CONCURRENT_SHADER_COMPILES = 1;
 const DEFAULT_SHADER_COMPILE_SLICE_BUDGET_MS = 8;
+const DEFAULT_SHADER_COMPILE_INFO_TIMEOUT_MS = 5000;
+const DEFAULT_MAX_PIPELINE_CAPACITY_YIELD_MS = 250;
 const DEFAULT_MAX_PENDING_RANGED_PIPELINES = 2048;
 const DEFAULT_HEAVY_SHADER_YIELD_BYTES = 64 * 1024;
 const DEFAULT_HEAVY_SHADER_YIELD_MS = 4;
@@ -1281,15 +1283,23 @@ function normalizeFallbackRouterResult(raw, lookupHashHex, stageName) {
  * Call `shaderFallbackRouter.resolve(hash, stage, { profile })` while staying 100%
  * backwards-compatible with legacy 2-arg routers (including strict mocks that reject a 3rd arg).
  */
-function callFallbackRouterResolve(router, lookupHashHex, stageName, profile) {
+function callFallbackRouterResolve(router, lookupHashHex, stageName, profile, extraOpts = null) {
   if (!router || typeof router.resolve !== 'function') {
     return null;
   }
   const canonicalProfile = normalizeFallbackProfileName(profile);
-  if (canonicalProfile !== FALLBACK_PROFILE.DEFAULT) {
+  const hasRangedPending = Boolean(extraOpts && extraOpts.rangedPending === true);
+  if (canonicalProfile !== FALLBACK_PROFILE.DEFAULT || hasRangedPending) {
+    const resolveOpts = {};
+    if (canonicalProfile !== FALLBACK_PROFILE.DEFAULT) {
+      resolveOpts.profile = canonicalProfile;
+    }
+    if (hasRangedPending) {
+      resolveOpts.rangedPending = true;
+    }
     try {
-      const withProfile = router.resolve(lookupHashHex, stageName, { profile: canonicalProfile });
-      const normalized = normalizeFallbackRouterResult(withProfile, lookupHashHex, stageName);
+      const withOpts = router.resolve(lookupHashHex, stageName, resolveOpts);
+      const normalized = normalizeFallbackRouterResult(withOpts, lookupHashHex, stageName);
       if (normalized) {
         return normalized;
       }
@@ -4189,6 +4199,7 @@ class WgpuCommandProcessor {
       options.lazyShaderCompile === 'pack' ? 'pack' : Boolean(options.lazyShaderCompile);
     this._lazyRangedShaderCompile = Boolean(options.lazyRangedShaderCompile);
     this._deferredShaderCount = 0;
+    this._liveDeferredRangedShaderCount = 0;
     this._materializedShaderCount = 0;
     this._cachedBuiltinShaderModules = new Map();
 
@@ -4214,6 +4225,20 @@ class WgpuCommandProcessor {
             options.shaderCompileSliceBudgetMs,
             DEFAULT_SHADER_COMPILE_SLICE_BUDGET_MS
           );
+    this._shaderCompileInfoTimeoutMs =
+      options.shaderCompileInfoTimeoutMs === 0
+        ? 0
+        : resolvePositiveIntOption(
+            options.shaderCompileInfoTimeoutMs,
+            DEFAULT_SHADER_COMPILE_INFO_TIMEOUT_MS
+          );
+    this._maxPipelineCapacityYieldMs =
+      options.maxPipelineCapacityYieldMs === 0
+        ? 0
+        : resolvePositiveIntOption(
+            options.maxPipelineCapacityYieldMs,
+            DEFAULT_MAX_PIPELINE_CAPACITY_YIELD_MS
+          );
     this._maxPendingRangedPipelines = resolvePositiveIntOption(
       options.maxPendingRangedPipelines,
       DEFAULT_MAX_PENDING_RANGED_PIPELINES
@@ -4221,10 +4246,14 @@ class WgpuCommandProcessor {
     this._deferRangedFallbackPipelines = options.deferRangedFallbackPipelines !== false;
     this._rangedShaderCompileQueue = [];
     this._rangedShaderCompileSeq = 0;
+    this._rangedShaderCompileQueueGen = 0;
     this._activeRangedShaderCompiles = 0;
     this._peakConcurrentRangedShaderCompiles = 0;
     this._rangedShaderCompileYields = 0;
+    this._rangedShaderCompileTimeouts = 0;
+    this._rangedShaderPipelineYieldStartMs = 0;
     this._rangedShaderCompilePumpTimer = null;
+    this._rangedShaderCompileActiveTimers = new Set();
     this._rangedShaderCompileMicrotaskPending = false;
     this._rangedShaderWaitingForPipelineIdle = false;
     this._coalescePresentsEnabled = options.coalescePresents !== false;
@@ -5330,6 +5359,18 @@ class WgpuCommandProcessor {
 
   get asyncShaderPendingCount() {
     return this._inFlightRangedShaders.size;
+  }
+
+  get deferredShaderCount() {
+    return this._liveDeferredRangedShaderCount;
+  }
+
+  get rangedShaderQueuedCount() {
+    return this._rangedShaderCompileQueue.length;
+  }
+
+  get rangedShaderCompileTimeouts() {
+    return this._rangedShaderCompileTimeouts;
   }
 
   _ensureValidationErrorHooked() {
@@ -9826,6 +9867,7 @@ class WgpuCommandProcessor {
     this._v2BindGroupLayouts.clear();
     this._v2PipelineLayouts.clear();
     this.shaderModules.clear();
+    this._liveDeferredRangedShaderCount = 0;
     this._cachedBuiltinShaderModules.clear();
     this._shaderModuleGenerations.clear();
     this._inFlightRangedShaders.clear();
@@ -12053,7 +12095,8 @@ class WgpuCommandProcessor {
       ) {
         let hintProfile = this._defaultFallbackProfile;
         // W346: Skip lookahead fallback-profile command-buffer scan when the requested hash
-        // is already present in the router's WGSL pack (100% of live pack-backed shaders).
+        // is already present in the router's WGSL pack (100% of live pack-backed shaders) or
+        // indexed in a ranged WGSL pack TOC that defers fallback pipeline compilation.
         const routerPackLoader = this.shaderFallbackRouter._packLoader;
         const knownCompileFailure =
           typeof this.shaderFallbackRouter.hasCompileFailure === 'function' &&
@@ -12061,7 +12104,17 @@ class WgpuCommandProcessor {
         const isPackHit =
           !knownCompileFailure &&
           Boolean(routerPackLoader && lookupFromPackCache(routerPackLoader, lookupHashHex));
-        if (!isPackHit) {
+        const rangedCandidate = this.wgslPackCache || routerPackLoader || null;
+        const isRangedTocHit =
+          !isPackHit &&
+          !knownCompileFailure &&
+          !this._oversizedShaderHashes.has(lookupHashHex) &&
+          Boolean(
+            rangedCandidate &&
+              typeof rangedCandidate.getWgslAsync === 'function' &&
+              resolvePackCacheHasKey(rangedCandidate, lookupHashHex).matched
+          );
+        if (!isPackHit && !(isRangedTocHit && this._deferRangedFallbackPipelines)) {
           const pendingHints = this._ensureCommandStreamFallbackProfiles();
           if (pendingHints && pendingHints.has(id)) {
             hintProfile = pendingHints.get(id);
@@ -12073,7 +12126,8 @@ class WgpuCommandProcessor {
           this.shaderFallbackRouter,
           lookupHashHex,
           stageName,
-          hintProfile
+          hintProfile,
+          isRangedTocHit ? { rangedPending: true } : null
         );
         if (resolved && typeof resolved.wgsl === 'string' && resolved.wgsl.length > 0) {
           code = resolved.wgsl;
@@ -12082,7 +12136,7 @@ class WgpuCommandProcessor {
           resolvedHash = resolved.resolvedHash !== undefined ? resolved.resolvedHash : null;
           hashHex = resolvedHash || fnv1a64Hex(code);
           entryPoint = resolved.entryPoint || extractWgslEntryPoint(code, stage);
-          if (source === 'builtin') {
+          if (source === 'builtin' && !isRangedTocHit) {
             fallbackProfile = normalizeFallbackProfileName(resolved.profile || hintProfile);
             this._recordFallbackProfileUsage(fallbackProfile);
           }
@@ -12131,12 +12185,20 @@ class WgpuCommandProcessor {
   }
 
   _clearRangedShaderCompileQueue() {
+    this._rangedShaderCompileQueueGen += 1;
     if (this._rangedShaderCompilePumpTimer !== null) {
       clearTimeout(this._rangedShaderCompilePumpTimer);
       this._rangedShaderCompilePumpTimer = null;
     }
+    if (this._rangedShaderCompileActiveTimers && this._rangedShaderCompileActiveTimers.size > 0) {
+      for (const timerId of this._rangedShaderCompileActiveTimers) {
+        clearTimeout(timerId);
+      }
+      this._rangedShaderCompileActiveTimers.clear();
+    }
     this._rangedShaderCompileMicrotaskPending = false;
     this._rangedShaderWaitingForPipelineIdle = false;
+    this._rangedShaderPipelineYieldStartMs = 0;
     this._activeRangedShaderCompiles = 0;
     if (Array.isArray(this._rangedShaderCompileQueue) && this._rangedShaderCompileQueue.length > 0) {
       const queued = this._rangedShaderCompileQueue;
@@ -12288,6 +12350,7 @@ class WgpuCommandProcessor {
       this._clearRangedShaderCompileQueue();
       return;
     }
+    const queueGen = this._rangedShaderCompileQueueGen;
     const maxConc = this._maxConcurrentShaderCompiles;
     const budgetMs = this._shaderCompileSliceBudgetMs;
     const sliceStartMs = this._getNowMs();
@@ -12298,35 +12361,52 @@ class WgpuCommandProcessor {
       (maxConc === 0 || this._activeRangedShaderCompiles < maxConc)
     ) {
       // Wave-5 (#663, #1077): Yield shader compilation when AsyncPipelineCache is already at
-      // capacity so shader compiles and pipeline compiles never pile up on Dawn simultaneously.
+      // capacity so shader compiles and pipeline compiles never pile up on Dawn simultaneously,
+      // bounded by `_maxPipelineCapacityYieldMs` so a slow/stalled pipeline can never starve shaders.
       if (this._isAsyncPipelineCacheAtCapacity()) {
-        this._scheduleRangedShaderCompilePump(true, DEFAULT_HEAVY_SHADER_YIELD_MS);
-        if (
-          !this._rangedShaderWaitingForPipelineIdle &&
-          this.asyncPipelineCache &&
-          typeof this.asyncPipelineCache.whenIdle === 'function'
-        ) {
-          this._rangedShaderWaitingForPipelineIdle = true;
-          Promise.resolve(this.asyncPipelineCache.whenIdle()).then(
-            () => {
-              this._rangedShaderWaitingForPipelineIdle = false;
-              if (this._destroyed || this._deviceLost || this._deviceRecovering) {
-                return;
-              }
-              if (this._rangedShaderCompileQueue.length > 0) {
-                if (this._rangedShaderCompilePumpTimer !== null) {
-                  clearTimeout(this._rangedShaderCompilePumpTimer);
-                  this._rangedShaderCompilePumpTimer = null;
-                }
-                this._pumpRangedShaderCompileQueue();
-              }
-            },
-            () => {
-              this._rangedShaderWaitingForPipelineIdle = false;
-            }
-          );
+        const nowMs = this._getNowMs();
+        if (this._rangedShaderPipelineYieldStartMs === 0) {
+          this._rangedShaderPipelineYieldStartMs = nowMs;
         }
-        return;
+        const yieldElapsedMs = nowMs - this._rangedShaderPipelineYieldStartMs;
+        const canStillYield =
+          this._maxPipelineCapacityYieldMs === 0 ||
+          yieldElapsedMs < this._maxPipelineCapacityYieldMs;
+        if (canStillYield) {
+          this._scheduleRangedShaderCompilePump(true, DEFAULT_HEAVY_SHADER_YIELD_MS);
+          if (
+            !this._rangedShaderWaitingForPipelineIdle &&
+            this.asyncPipelineCache &&
+            typeof this.asyncPipelineCache.whenIdle === 'function'
+          ) {
+            this._rangedShaderWaitingForPipelineIdle = true;
+            Promise.resolve(this.asyncPipelineCache.whenIdle()).then(
+              () => {
+                this._rangedShaderWaitingForPipelineIdle = false;
+                this._rangedShaderPipelineYieldStartMs = 0;
+                if (this._destroyed || this._deviceLost || this._deviceRecovering) {
+                  return;
+                }
+                if (this._rangedShaderCompileQueue.length > 0) {
+                  if (this._rangedShaderCompilePumpTimer !== null) {
+                    clearTimeout(this._rangedShaderCompilePumpTimer);
+                    this._rangedShaderCompilePumpTimer = null;
+                  }
+                  this._pumpRangedShaderCompileQueue();
+                }
+              },
+              () => {
+                this._rangedShaderWaitingForPipelineIdle = false;
+                this._rangedShaderPipelineYieldStartMs = 0;
+              }
+            );
+          }
+          return;
+        }
+        // Pipeline capacity yield cap reached: allow forward progress for one shader compile.
+        this._rangedShaderPipelineYieldStartMs = 0;
+      } else {
+        this._rangedShaderPipelineYieldStartMs = 0;
       }
 
       if (startedInSlice > 0 && budgetMs > 0) {
@@ -12358,15 +12438,46 @@ class WgpuCommandProcessor {
         outcome = null;
       }
 
+      if (!outcome || typeof outcome !== 'object') {
+        // Job was superseded, oversized, or threw before creating a shader module — release slot immediately.
+        if (this._rangedShaderCompileQueueGen === queueGen) {
+          this._activeRangedShaderCompiles = Math.max(0, this._activeRangedShaderCompiles - 1);
+        }
+        job.resolve(null);
+        continue;
+      }
+
       const compilationPromise =
-        outcome && outcome.compilationPromise && typeof outcome.compilationPromise.then === 'function'
+        outcome.compilationPromise && typeof outcome.compilationPromise.then === 'function'
           ? outcome.compilationPromise
           : null;
-      const finalize = outcome && typeof outcome.finalize === 'function' ? outcome.finalize : null;
+      const finalize = typeof outcome.finalize === 'function' ? outcome.finalize : null;
 
       if (compilationPromise) {
-        const onSettled = () => {
+        let settled = false;
+        let timeoutId = null;
+        const onSettled = (timedOut) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          if (timeoutId !== null) {
+            clearTimeout(timeoutId);
+            this._rangedShaderCompileActiveTimers.delete(timeoutId);
+            timeoutId = null;
+          }
+          if (this._rangedShaderCompileQueueGen !== queueGen) {
+            job.resolve(null);
+            return;
+          }
           this._activeRangedShaderCompiles = Math.max(0, this._activeRangedShaderCompiles - 1);
+          if (timedOut) {
+            this._rangedShaderCompileTimeouts += 1;
+            this._logDiagnostic(
+              'warn',
+              `[wgpu_worker] ranged shader getCompilationInfo() timed out after ${this._shaderCompileInfoTimeoutMs}ms (queued=${this._rangedShaderCompileQueue.length}, frame=${this.frameCount}); releasing compile slot`
+            );
+          }
           let result = null;
           if (finalize) {
             try {
@@ -12376,7 +12487,12 @@ class WgpuCommandProcessor {
             }
           }
           job.resolve(result);
-          if (this._rangedShaderCompileQueue.length > 0) {
+          if (
+            !this._destroyed &&
+            !this._deviceLost &&
+            !this._deviceRecovering &&
+            this._rangedShaderCompileQueue.length > 0
+          ) {
             const elapsedAfter = this._getNowMs() - sliceStartMs;
             const needMacrotaskYield = isHeavyShader || (budgetMs > 0 && elapsedAfter >= budgetMs);
             this._scheduleRangedShaderCompilePump(
@@ -12385,7 +12501,16 @@ class WgpuCommandProcessor {
             );
           }
         };
-        compilationPromise.then(onSettled, onSettled);
+        if (this._shaderCompileInfoTimeoutMs > 0) {
+          timeoutId = setTimeout(() => {
+            onSettled(true);
+          }, this._shaderCompileInfoTimeoutMs);
+          this._rangedShaderCompileActiveTimers.add(timeoutId);
+        }
+        compilationPromise.then(
+          () => onSettled(false),
+          () => onSettled(false)
+        );
       } else {
         let result = null;
         if (finalize) {
@@ -12398,7 +12523,15 @@ class WgpuCommandProcessor {
         job.resolve(result);
         const elapsedAfter = this._getNowMs() - sliceStartMs;
         const needMacrotaskYield = isHeavyShader || (budgetMs > 0 && elapsedAfter >= budgetMs);
+        let slotReleased = false;
         const releaseSlot = () => {
+          if (slotReleased) {
+            return;
+          }
+          slotReleased = true;
+          if (this._rangedShaderCompileQueueGen !== queueGen) {
+            return;
+          }
           this._activeRangedShaderCompiles = Math.max(0, this._activeRangedShaderCompiles - 1);
           if (
             !this._destroyed &&
@@ -12413,11 +12546,13 @@ class WgpuCommandProcessor {
           this._rangedShaderCompileYields += 1;
           const yieldDelay = isHeavyShader ? DEFAULT_HEAVY_SHADER_YIELD_MS : 0;
           const timerId = setTimeout(() => {
+            this._rangedShaderCompileActiveTimers.delete(timerId);
             if (this._rangedShaderCompilePumpTimer === timerId) {
               this._rangedShaderCompilePumpTimer = null;
             }
             releaseSlot();
           }, yieldDelay);
+          this._rangedShaderCompileActiveTimers.add(timerId);
           if (this._rangedShaderCompilePumpTimer === null) {
             this._rangedShaderCompilePumpTimer = timerId;
           }
@@ -12636,6 +12771,7 @@ class WgpuCommandProcessor {
     }
     const lazy = entry.lazyRanged;
     entry.lazyRanged = null;
+    this._liveDeferredRangedShaderCount = Math.max(0, this._liveDeferredRangedShaderCount - 1);
     if (this._shaderModuleGenerations.get(id) !== lazy.shaderGen) {
       return null;
     }
@@ -12868,8 +13004,27 @@ class WgpuCommandProcessor {
       }
     };
 
+    const stageName = stageCodeToName(stage) || 'vertex';
+
+    const recordRangedPackHit = () => {
+      if (
+        this.shaderFallbackRouter &&
+        typeof this.shaderFallbackRouter.recordPackHit === 'function'
+      ) {
+        try {
+          this.shaderFallbackRouter.recordPackHit(lookupHashHex, stageName);
+        } catch (_) {
+          // Never allow telemetry tracking errors to interrupt shader resolution.
+        }
+      }
+    };
+
     const failCurrent = (errMsg) => {
       const cur = this.shaderModules.get(id);
+      if (cur && cur.lazyRanged) {
+        cur.lazyRanged = null;
+        this._liveDeferredRangedShaderCount = Math.max(0, this._liveDeferredRangedShaderCount - 1);
+      }
       if (cur && cur.pendingRanged) {
         cur.pendingRanged = false;
         cur.rangedFailed = true;
@@ -12885,8 +13040,36 @@ class WgpuCommandProcessor {
       this._rangedShaderErrors += 1;
       if (errMsg !== undefined && errMsg !== null) {
         this._recordOpValidationError('CreateShaderModule', errMsg);
+        if (
+          this.shaderFallbackRouter &&
+          typeof this.shaderFallbackRouter.recordMissingShader === 'function' &&
+          lookupHashHex
+        ) {
+          try {
+            this.shaderFallbackRouter.recordMissingShader(lookupHashHex, stageName, 'not_in_pack');
+          } catch (_) {
+            // Never allow telemetry tracking errors to interrupt shader resolution.
+          }
+        }
       }
       this._onRangedShaderSettled(id, false);
+    };
+
+    const commitCompiledEntry = (compiled) => {
+      const prev = this.shaderModules.get(id);
+      if (prev && prev.lazyRanged) {
+        prev.lazyRanged = null;
+        this._liveDeferredRangedShaderCount = Math.max(0, this._liveDeferredRangedShaderCount - 1);
+      }
+      this.shaderModules.set(id, compiled);
+      this._shaderModuleGenerations.set(id, ++this._nextShaderModuleGen);
+      this._invalidatePipelinesReferencingShader(id);
+      this._rangedShaderReady += 1;
+      if (compiled && compiled.source === 'pack') {
+        recordRangedPackHit();
+      }
+      this._onRangedShaderSettled(id, true);
+      return compiled;
     };
 
     let fetchPromise;
@@ -12900,123 +13083,124 @@ class WgpuCommandProcessor {
       return Promise.resolve(null);
     }
 
-    const settledPromise = fetchPromise.then(
-      (rawResult) => {
-        if (!isStillCurrent()) {
-          cleanup();
-          return null;
-        }
-        const hit = unwrapPackLookupResult(rawResult);
-        const wgsl = hit && typeof hit.wgsl === 'string' ? hit.wgsl : null;
-        if (!wgsl || wgsl.length === 0) {
-          cleanup();
-          failCurrent(`shader ${id}: ranged WGSL fetch for ${lookupHashHex} returned empty payload`);
-          return null;
-        }
-        let metaEntryPoint = hit && hit.entryPoint ? hit.entryPoint : null;
-        if (!metaEntryPoint && typeof packCache.getShaderMetadata === 'function') {
-          try {
-            const meta = packCache.getShaderMetadata(lookupKey);
-            if (meta && typeof meta.entryPoint === 'string' && meta.entryPoint.length > 0) {
-              metaEntryPoint = meta.entryPoint;
-            }
-          } catch (_) {
-            // Optional metadata lookup failure is non-fatal.
-          }
-        }
-        const realEntry = {
-          module: null,
-          stage,
-          code: wgsl,
-          codeLen: wgsl.length,
-          isInlineCode: false,
-          hashHex: lookupHashHex,
-          entryPoint: metaEntryPoint || extractWgslEntryPoint(wgsl, stage),
-          source: 'pack',
-          requestedHash: lookupHashHex,
-          resolvedHash: lookupHashHex,
-          fallbackProfile: null,
-        };
-        // Wave-5 (#663, #1077): Quarantine oversized ranged WGSL immediately BEFORE ever
-        // entering _rangedShaderCompileQueue or calling device.createShaderModule().
-        const maxBytes = this._maxWgslCompileBytes;
-        if (maxBytes > 0 && wgsl.length > maxBytes) {
-          const compiled = this._compileShaderModuleEntry(id, realEntry, false);
-          cleanup();
+    const settledPromise = fetchPromise
+      .then(
+        (rawResult) => {
           if (!isStillCurrent()) {
+            cleanup();
             return null;
           }
-          if (!compiled) {
-            if (realEntry.oversizedRejected) {
-              const cur = this.shaderModules.get(id);
-              if (cur && cur.pendingRanged) {
-                cur.pendingRanged = false;
-                cur.oversizedRejected = true;
+          const hit = unwrapPackLookupResult(rawResult);
+          const wgsl = hit && typeof hit.wgsl === 'string' ? hit.wgsl : null;
+          if (!wgsl || wgsl.length === 0) {
+            cleanup();
+            failCurrent(`shader ${id}: ranged WGSL fetch for ${lookupHashHex} returned empty payload`);
+            return null;
+          }
+          let metaEntryPoint = hit && hit.entryPoint ? hit.entryPoint : null;
+          if (!metaEntryPoint && typeof packCache.getShaderMetadata === 'function') {
+            try {
+              const meta = packCache.getShaderMetadata(lookupKey);
+              if (meta && typeof meta.entryPoint === 'string' && meta.entryPoint.length > 0) {
+                metaEntryPoint = meta.entryPoint;
               }
-              this._onRangedShaderSettled(id, false);
-              return null;
+            } catch (_) {
+              // Optional metadata lookup failure is non-fatal.
             }
-            failCurrent(null);
-            return null;
           }
-          this.shaderModules.set(id, compiled);
-          this._shaderModuleGenerations.set(id, ++this._nextShaderModuleGen);
-          this._invalidatePipelinesReferencingShader(id);
-          this._rangedShaderReady += 1;
-          this._onRangedShaderSettled(id, true);
-          return compiled;
-        }
-        return this._enqueueRangedShaderCompile(
-          () => {
+          const realEntry = {
+            module: null,
+            stage,
+            code: wgsl,
+            codeLen: wgsl.length,
+            isInlineCode: false,
+            hashHex: lookupHashHex,
+            entryPoint: metaEntryPoint || extractWgslEntryPoint(wgsl, stage),
+            source: 'pack',
+            requestedHash: lookupHashHex,
+            resolvedHash: lookupHashHex,
+            fallbackProfile: null,
+          };
+          // Wave-5 (#663, #1077): Quarantine oversized ranged WGSL immediately BEFORE ever
+          // entering _rangedShaderCompileQueue or calling device.createShaderModule().
+          const maxBytes = this._maxWgslCompileBytes;
+          if (maxBytes > 0 && wgsl.length > maxBytes) {
+            const compiled = this._compileShaderModuleEntry(id, realEntry, false);
+            cleanup();
             if (!isStillCurrent()) {
-              cleanup();
               return null;
             }
-            const compiled = this._compileShaderModuleEntry(id, realEntry, false);
-            return {
-              compilationPromise: compiled ? compiled._compilationInfoPromise || null : null,
-              finalize: () => {
-                cleanup();
-                if (!isStillCurrent()) {
-                  return null;
+            if (!compiled) {
+              if (realEntry.oversizedRejected) {
+                const cur = this.shaderModules.get(id);
+                if (cur && cur.pendingRanged) {
+                  cur.pendingRanged = false;
+                  cur.oversizedRejected = true;
                 }
-                if (!compiled) {
-                  if (realEntry.oversizedRejected) {
-                    const cur = this.shaderModules.get(id);
-                    if (cur && cur.pendingRanged) {
-                      cur.pendingRanged = false;
-                      cur.oversizedRejected = true;
-                    }
-                    this._onRangedShaderSettled(id, false);
+                this._onRangedShaderSettled(id, false);
+                return null;
+              }
+              failCurrent(null);
+              return null;
+            }
+            return commitCompiledEntry(compiled);
+          }
+          return this._enqueueRangedShaderCompile(
+            () => {
+              if (!isStillCurrent()) {
+                cleanup();
+                return null;
+              }
+              const compiled = this._compileShaderModuleEntry(id, realEntry, false);
+              return {
+                compilationPromise: compiled ? compiled._compilationInfoPromise || null : null,
+                finalize: () => {
+                  cleanup();
+                  if (!isStillCurrent()) {
                     return null;
                   }
-                  failCurrent(null);
-                  return null;
-                }
-                this.shaderModules.set(id, compiled);
-                this._shaderModuleGenerations.set(id, ++this._nextShaderModuleGen);
-                this._invalidatePipelinesReferencingShader(id);
-                this._rangedShaderReady += 1;
-                this._onRangedShaderSettled(id, true);
-                return compiled;
-              },
-            };
-          },
-          { stage, byteLength: wgsl.length }
-        );
-      },
-      (err) => {
-        cleanup();
-        if (
-          !this._destroyed &&
-          this._deviceGeneration === deviceGeneration &&
-          this._shaderModuleGenerations.get(id) === record.gen
-        ) {
-          failCurrent(err);
+                  if (!compiled) {
+                    if (realEntry.oversizedRejected) {
+                      const cur = this.shaderModules.get(id);
+                      if (cur && cur.pendingRanged) {
+                        cur.pendingRanged = false;
+                        cur.oversizedRejected = true;
+                      }
+                      this._onRangedShaderSettled(id, false);
+                      return null;
+                    }
+                    failCurrent(null);
+                    return null;
+                  }
+                  return commitCompiledEntry(compiled);
+                },
+              };
+            },
+            { stage, byteLength: wgsl.length }
+          );
+        },
+        (err) => {
+          cleanup();
+          if (
+            !this._destroyed &&
+            this._deviceGeneration === deviceGeneration &&
+            this._shaderModuleGenerations.get(id) === record.gen
+          ) {
+            failCurrent(err);
+          }
+          return null;
         }
-        return null;
-      }
-    );
+      )
+      .then(
+        (res) => {
+          cleanup();
+          return res;
+        },
+        () => {
+          cleanup();
+          return null;
+        }
+      );
 
     record.promise = settledPromise;
     return settledPromise;
@@ -13039,6 +13223,12 @@ class WgpuCommandProcessor {
     const rawCode = this._decoder.decode(isShared ? rawBytes.slice() : rawBytes);
     const trimmed = rawCode.trim();
     const hashOnlyHex = parseHashOnlyShaderPayload(trimmed);
+
+    const prevShaderEntry = this.shaderModules.get(id);
+    if (prevShaderEntry && prevShaderEntry.lazyRanged) {
+      prevShaderEntry.lazyRanged = null;
+      this._liveDeferredRangedShaderCount = Math.max(0, this._liveDeferredRangedShaderCount - 1);
+    }
 
     const shaderGen = ++this._nextShaderModuleGen;
     this._shaderModuleGenerations.set(id, shaderGen);
@@ -13180,6 +13370,7 @@ class WgpuCommandProcessor {
           lookupKey: rangedLookupKey,
         };
         this._deferredShaderCount += 1;
+        this._liveDeferredRangedShaderCount += 1;
         this.shaderModules.set(id, entry);
         if (this._pendingRangedPipelines.size > 0) {
           for (const rec of this._pendingRangedPipelines.values()) {
@@ -15619,6 +15810,11 @@ class WgpuCommandProcessor {
     this._v2BindGroupLayouts.delete(id);
     this._v2PipelineLayouts.delete(id);
     this._invalidateSpecializedBindGroupsFor(id);
+    const destroyedShader = this.shaderModules.get(id);
+    if (destroyedShader && destroyedShader.lazyRanged) {
+      destroyedShader.lazyRanged = null;
+      this._liveDeferredRangedShaderCount = Math.max(0, this._liveDeferredRangedShaderCount - 1);
+    }
     this.shaderModules.delete(id);
     this._shaderModuleGenerations.delete(id);
     this._inFlightRangedShaders.delete(id);
@@ -18560,6 +18756,9 @@ class WgpuCommandProcessor {
       rangedPackActive,
       rangedPackThresholdBytes,
       asyncShaderPendingCount,
+      deferredShaderCount: this._liveDeferredRangedShaderCount,
+      rangedShaderQueuedCount: this._rangedShaderCompileQueue.length,
+      rangedShaderCompileTimeouts: this._rangedShaderCompileTimeouts,
       rangedShaderFetches: this._rangedShaderFetches,
       rangedShaderReady: this._rangedShaderReady,
       rangedShaderErrors: this._rangedShaderErrors,
@@ -18717,6 +18916,7 @@ class WgpuCommandProcessor {
     this._v2PipelineLayouts.clear();
     this._validationErrorDedup.clear();
     this.shaderModules.clear();
+    this._liveDeferredRangedShaderCount = 0;
     this._cachedBuiltinShaderModules.clear();
     this._shaderModuleGenerations.clear();
     this._inFlightRangedShaders.clear();
@@ -20030,6 +20230,30 @@ function resolveShaderPackTelemetry(processor, stats) {
     rangedPackActive,
     rangedPackThresholdBytes,
     asyncShaderPendingCount,
+    deferredShaderCount: toNonNegativeInt(
+      processor && processor._liveDeferredRangedShaderCount !== undefined
+        ? processor._liveDeferredRangedShaderCount
+        : stats && stats.deferredShaderCount !== undefined
+          ? stats.deferredShaderCount
+          : raw.deferredShaderCount,
+      0
+    ),
+    rangedShaderQueuedCount: toNonNegativeInt(
+      processor && Array.isArray(processor._rangedShaderCompileQueue)
+        ? processor._rangedShaderCompileQueue.length
+        : stats && stats.rangedShaderQueuedCount !== undefined
+          ? stats.rangedShaderQueuedCount
+          : raw.rangedShaderQueuedCount,
+      0
+    ),
+    rangedShaderCompileTimeouts: toNonNegativeInt(
+      processor && processor._rangedShaderCompileTimeouts !== undefined
+        ? processor._rangedShaderCompileTimeouts
+        : stats && stats.rangedShaderCompileTimeouts !== undefined
+          ? stats.rangedShaderCompileTimeouts
+          : raw.rangedShaderCompileTimeouts,
+      0
+    ),
     rangedShaderFetches: toNonNegativeInt(
       processor && processor._rangedShaderFetches !== undefined
         ? processor._rangedShaderFetches
