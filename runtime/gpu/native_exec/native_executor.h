@@ -457,6 +457,7 @@ struct ExecutorStats {
     uint64_t depth_half_twins_created = 0; // r16float twins (float entry, device without float32-filterable): half-precision depth
     uint64_t pipeline_variants_created = 0;     // render pipelines rebuilt with the attachment formats / samples of the pass they are drawn into
     uint64_t pipeline_variants_unsupported = 0; // pipelines that differ from their pass but cannot be rebuilt (auto layout)
+    uint64_t pipeline_variants_failed = 0;      // variants whose compile failed: draws dropped instead of using the mismatching base pipeline
     uint64_t depth_stencil_direct_binds = 0;  // stencil-aspect views bound to a uint entry (no twin: the stencil aspect is uint)
     uint64_t reflection_layout_unsupported = 0;  // layout entries Dawn cannot take (externalTexture, unknown storage format)
     uint64_t manifest_layouts_resolved = 0;    // ManifestReference layouts served from a loaded layout-manifest.json

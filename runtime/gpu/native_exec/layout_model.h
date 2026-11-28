@@ -434,6 +434,13 @@ inline bool explicit_layout_compatible(const std::vector<Group0LayoutEntry>* ent
 
 constexpr uint32_t kRemapBufferUsageUniform = 0x0040;
 constexpr uint32_t kRemapBufferUsageStorage = 0x0080;
+
+// The usage bits a created buffer gets on top of the title's own: a storage buffer can also be bound as a
+// uniform (D3D12 root CBVs address any buffer; a uniform layout entry over a buffer without the usage is
+// a validation error).
+constexpr uint32_t buffer_usage_with_uniform(uint32_t usage) {
+    return (usage & kRemapBufferUsageStorage) ? (usage | kRemapBufferUsageUniform) : usage;
+}
 constexpr uint32_t kRemapTextureUsageBinding = 0x0004;
 constexpr uint32_t kRemapTextureUsageStorage = 0x0008;
 
@@ -644,6 +651,14 @@ public:
             used_[i] = true;
             const bool r_buf = r.kind == WgslBindingKind::Uniform || r.kind == WgslBindingKind::Storage ||
                                r.kind == WgslBindingKind::ReadOnlyStorage;
+            // A buffer bound by number still needs the usage the WGSL binding reads it with.
+            if (r_buf && r.buffer_usage) {
+                const uint32_t need = b.kind == WgslBindingKind::Uniform ? kRemapBufferUsageUniform
+                                      : (b.kind == WgslBindingKind::Storage || b.kind == WgslBindingKind::ReadOnlyStorage)
+                                          ? kRemapBufferUsageStorage
+                                          : 0u;
+                if (need && (*r.buffer_usage & need) == 0) return PickResult{PickResult::Kind::Dummy};
+            }
             return r_buf ? buffer_result(i, r) : PickResult{PickResult::Kind::Resource, i};
         }
         if (b.kind == WgslBindingKind::Sampler) return PickResult{PickResult::Kind::FallbackSampler};

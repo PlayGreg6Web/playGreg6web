@@ -4140,10 +4140,13 @@ struct NativeExecutor::Impl {
         bd.usage = static_cast<wgpu::BufferUsage>(c.usage_flags);
         // A storage buffer can be copied (an aliasing read-only binding is bound through a copy).
         if (c.usage_flags & 0x80u) bd.usage |= wgpu::BufferUsage::CopySrc;
+        // ... and it can be read as a uniform: D3D12 root CBVs address any buffer, and a bind group layout
+        // entry of type uniform over a buffer without the usage is a validation error.
+        bd.usage |= static_cast<wgpu::BufferUsage>(buffer_usage_with_uniform(c.usage_flags));
         BufferEntry e;
         e.buffer = device.CreateBuffer(&bd);
         e.size = c.byte_size;
-        e.usage = c.usage_flags;
+        e.usage = c.usage_flags;  // the title's flags: worker-parity checks read these
         buffers[c.id] = std::move(e);
     }
 
@@ -8327,26 +8330,45 @@ struct NativeExecutor::Impl {
         return false;
     }
 
-    // The variant of `base` for the pass's attachment state (built on first use), or null when the pipeline
-    // already matches or cannot be rebuilt (auto layout: its bind group layouts belong to that pipeline only).
-    const RenderPipelineEntry* pipeline_variant(const RenderPipelineEntry& base, const PassFormats& pf) {
-        if (!base.rebuild || base.deferred || base.failed || base.pending) return nullptr;
-        if (!attachment_state_differs(base.rebuild->h.key, pf)) return nullptr;
+    // The variant of `base` for the pass's attachment state (built on first use). `v` is null when the
+    // pipeline already matches (or cannot be judged); `block` is set when it differs from the pass but no
+    // variant can be had (auto layout, a failed build): the draws are dropped, because encoding them would
+    // invalidate the whole command buffer ("attachment state not compatible").
+    struct VariantPick {
+        const RenderPipelineEntry* v = nullptr;
+        bool block = false;
+    };
+    void note_variant_problem(const char* why, uint32_t id, const RenderPipelineEntry& base, const PassFormats& pf) {
+        if (stats.pipeline_variants_unsupported + stats.pipeline_variants_failed > 6) return;
+        const GpuRenderPipelineKey& k = base.rebuild->h.key;
+        std::string m = "[native_exec] pipeline " + std::to_string(id) + " cannot match its pass (" + why + "): pipeline targets";
+        for (uint32_t i = 0; i < std::min<uint32_t>(k.color_target_count, 8); ++i) m += " " + std::to_string(k.color_targets[i].format);
+        m += " depth " + std::to_string(k.depth_stencil.format) + " ms " + std::to_string(k.multisample.count) + "; pass";
+        for (uint32_t i = 0; i < kGpuMaxColorAttachments; ++i)
+            if (pf.color_known >> i & 1u) m += " " + std::to_string(pf.color[i]);
+        m += " depth " + std::to_string(pf.depth) + " ms " + std::to_string(pf.samples);
+        std::fprintf(stderr, "%s\n", m.c_str());
+    }
+    VariantPick pipeline_variant(uint32_t id, const RenderPipelineEntry& base, const PassFormats& pf) {
+        if (!base.rebuild || base.deferred || base.failed || base.pending) return {};
+        if (!attachment_state_differs(base.rebuild->h.key, pf)) return {};
         if (!base.rebuild->layout || base.auto_meta.remap) {
+            note_variant_problem("auto layout", id, base, pf);
             ++stats.pipeline_variants_unsupported;
-            return nullptr;
+            return {nullptr, true};
         }
         const uint64_t key = pf.hash();
         auto it = base.variants.find(key);
-        if (it != base.variants.end()) return it->second.get();
+        if (it != base.variants.end()) return {it->second.get(), false};
         auto v = std::make_shared<RenderPipelineEntry>();
         const PipelineRebuild& rb = *base.rebuild;
         if (!build_render_pipeline2(rb.h, &*rb.layout, *rb.vs, rb.fs.get(), &pf, v.get())) {
+            note_variant_problem("build failed", id, base, pf);
             ++stats.pipeline_variants_unsupported;
-            return nullptr;
+            return {nullptr, true};
         }
         ++stats.pipeline_variants_created;
-        return base.variants.emplace(key, std::move(v)).first->second.get();
+        return {base.variants.emplace(key, std::move(v)).first->second.get(), false};
     }
 
     void run_cmd(Encoder& e, const PassCmd& cmd) {
@@ -8374,9 +8396,20 @@ struct NativeExecutor::Impl {
             e.variant_blocked = false;
             if (plp && *plp && it != render_pipelines.end() && e.pass_fmt.known) {
                 // The pipeline must have the attachment state of the pass it is drawn into.
-                if (const RenderPipelineEntry* v = pipeline_variant(it->second, e.pass_fmt)) {
-                    if (const wgpu::RenderPipeline* vp = resolve_budgeted(*v)) plp = vp;
-                    else if (!v->failed) e.variant_blocked = true;  // still compiling past the budget: draws are dropped
+                const VariantPick vp = pipeline_variant(sp->id, it->second, e.pass_fmt);
+                if (vp.block) {
+                    e.variant_blocked = true;
+                } else if (vp.v) {
+                    if (const wgpu::RenderPipeline* p = resolve_budgeted(*vp.v)) {
+                        plp = p;
+                    } else {
+                        // Still compiling past the budget, or failed: the base pipeline would not match the pass.
+                        if (vp.v->failed) {
+                            note_variant_problem("variant failed", sp->id, it->second, e.pass_fmt);
+                            ++stats.pipeline_variants_failed;
+                        }
+                        e.variant_blocked = true;
+                    }
                 }
             }
             if (e.variant_blocked) plp = nullptr;
@@ -11567,6 +11600,7 @@ std::string NativeExecutor::stats_json() const {
     num("depth_half_twins_created", st.depth_half_twins_created);
     num("pipeline_variants_created", st.pipeline_variants_created);
     num("pipeline_variants_unsupported", st.pipeline_variants_unsupported);
+    num("pipeline_variants_failed", st.pipeline_variants_failed);
     num("depth_stencil_direct_binds", st.depth_stencil_direct_binds);
     num("show_target_frames", st.show_target_frames);
     num("show_target_unavailable", st.show_target_unavailable);

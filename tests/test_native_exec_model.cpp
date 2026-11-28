@@ -843,6 +843,19 @@ void test_layout_remap() {
     r = p3.pick(wu);
     CHECK(r.kind == PickResult::Kind::Dummy && r.dyn_oob);
 
+    // pick_binding: a buffer bound at the WGSL's number still needs the usage the binding reads it with
+    std::vector<RemapResource> pb(1);
+    pb[0].binding = 3; pb[0].kind = WgslBindingKind::Storage; pb[0].buffer_usage = 0x80 | 0x08;
+    pb[0].buffer_total = 256;
+    WgslBinding wb3; wb3.kind = WgslBindingKind::Uniform; wb3.binding = 3;
+    RemapPicker pk3(pb, {}, true);
+    CHECK(pk3.pick_binding(wb3).kind == PickResult::Kind::Dummy);  // storage-only buffer, uniform binding
+    pb[0].buffer_usage = buffer_usage_with_uniform(0x80 | 0x08);
+    RemapPicker pk4(pb, {}, true);
+    CHECK(pk4.pick_binding(wb3).kind == PickResult::Kind::Resource);
+    CHECK(buffer_usage_with_uniform(0x80 | 0x08) == (0x80 | 0x08 | 0x40));
+    CHECK(buffer_usage_with_uniform(0x20) == 0x20);  // a vertex buffer stays as it is
+
     // synthesized layout entries for dummies
     WgslBinding sb; sb.kind = WgslBindingKind::StorageTexture; sb.storage_format = "r32float"; sb.view_dim = 2;
     const SynthLayoutEntry se = synth_layout_entry(sb);
