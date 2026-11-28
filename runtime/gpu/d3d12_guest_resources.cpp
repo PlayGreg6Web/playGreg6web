@@ -2083,7 +2083,7 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     // then enforce the entry count ceiling. Prefer evicting textures not used in the current frame,
     // and defer DestroyResource until after Present for any in-frame victim.
     CommandEncoder drop;
-    bridge_->advance_present_frame(stats().presents, drop);
+    bridge_->advance_present_frame(presents(), drop);
     // Parked large textures stay counted in the budget: give them back before the use nears the
     // size-cap tiers or LRU reclamation, so they never cost a live texture its top levels.
     if (const uint64_t parked_large = large_texture_pool().stats().parked_bytes; parked_large != 0) {
@@ -2364,7 +2364,7 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
     std::lock_guard<std::mutex> flush_lock(flush_mutex_, std::adopt_lock);
     // G70 (#691): emit deferred DestroyResource packets from the previous frame once Present has
     // advanced (strictly after that frame's Present and before any draw in the new frame).
-    bridge_->advance_present_frame(stats().presents, encoder);
+    bridge_->advance_present_frame(presents(), encoder);
     // O36: one pass over the translated window's write marks for the buffers and the relocated
     // ranges below. A relocated range in the window whose slots are unmarked has not been written
     // since its bytes were last read (the same protocol as the buffers: marks taken before the
@@ -3388,7 +3388,7 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
             } else {
                 const uint32_t old_id = lru_it->second.buffer_id;
                 bridge_->unregister_resource(old_id);
-                bridge_->advance_present_frame(stats().presents, enc);
+                bridge_->advance_present_frame(presents(), enc);
                 bridge_->destroy_or_defer_resource(old_id, enc);
                 storage_relocation_buffers_.erase(
                     std::remove(storage_relocation_buffers_.begin(), storage_relocation_buffers_.end(), old_id),
@@ -3439,7 +3439,11 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
         enc.write_buffer(target_buf, static_cast<uint32_t>(target_off + off),
                          bytes.data() + off, static_cast<uint32_t>(n));
     }
-    submit(enc);
+    // Not submit(): the sink can block (live pump backpressure) and storage_relocation_mutex_ is held,
+    // which stalled every recording thread binding a storage range (refresh_memory_bind_groups too)
+    // behind the pump. The upload goes out at the start of the next submission, before any command
+    // list that binds the home (the entry below is visible only after it is queued).
+    submit_with_next(enc);
     count_work(Work::BufferUploads);
     note_upload(write_len);
 
@@ -3482,9 +3486,9 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
         }
         bridge_->unregister_resource(chunk);
         CommandEncoder rel;
-        bridge_->advance_present_frame(stats().presents, rel);
+        bridge_->advance_present_frame(presents(), rel);
         bridge_->destroy_or_defer_resource(chunk, rel);
-        submit(rel);
+        submit_with_next(rel);
         storage_relocation_buffers_.erase(
             std::remove(storage_relocation_buffers_.begin(), storage_relocation_buffers_.end(), chunk),
             storage_relocation_buffers_.end());
@@ -3604,7 +3608,7 @@ bool Device::relocate_ia_buffer(uint64_t va, uint64_t size, uint32_t* buffer_id,
     // (preferring entries not used in the current frame, and deferring DestroyResource past Present
     // if a current-frame buffer had to be evicted).
     CommandEncoder enc;
-    bridge_->advance_present_frame(stats().presents, enc);
+    bridge_->advance_present_frame(presents(), enc);
     while (!ia_relocations_.empty() &&
            (ia_relocations_.size() >= kMaxEntries || ia_relocation_bytes_ + buffer_bytes > kMaxTotalBytes)) {
         auto lru = ia_relocations_.end();
@@ -3770,7 +3774,7 @@ Resource::~Resource() {
         device_->resource_states().unregister_resource(id_);
         if (is_buffer() || gpu_texture_) {
             CommandEncoder enc;
-            device_->state_bridge().advance_present_frame(device_->stats().presents, enc);
+            device_->state_bridge().advance_present_frame(device_->presents(), enc);
             // Keep a still-deferred create if any unexecuted command list or in-frame command
             // already references this id: emit_locked writes the create before the first reference
             // and drops DestroyResource if the list is reset without executing.

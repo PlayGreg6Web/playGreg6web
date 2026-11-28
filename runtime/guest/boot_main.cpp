@@ -28,7 +28,8 @@
 //   --skip-shader-file <path>  same, one `<hash> [reason] [issue]` per line; the repo list runtime/gpu/native_exec/shader_quarantine.txt is loaded too when present (--no-quarantine-list skips it)
 //   --profile-guest[=hz] opt-in sampling profiler (Windows, default 1000 Hz): suspends each guest thread, maps the host RIP and stack to
 //                        lifted functions (sub_<guest VA>) / runtime / OS and writes `guest_profile` (flat + inclusive top-N per thread)
-//                        into the boot report plus <report>.guest-profile.collapsed.txt (flamegraph.pl input)
+//                        into the boot report plus <report>.guest-profile.collapsed.txt (flamegraph.pl input); with
+//                        --live-executor / --window the executor's pump thread is sampled too (thread_id 4294901761)
 //   --no-present-pacing  presents do not wait for the 60 Hz vblank (benchmarks; gpu/present_pacing.h)
 //   --flush-full         CPU-visible buffer flush compares every buffer / uniform range at every
 //                        submission (the pre-#1963 behaviour; A/B runs)
@@ -856,6 +857,19 @@ void profile_thread_started(uint32_t thread_id) {
     }
 }
 
+// --profile / --profile-guest also sample one host thread that runs no guest code: the live executor's pump
+// (packet translation, Dawn encoding and submits, read-back waits), reported as thread kProfilePumpThreadId.
+constexpr uint32_t kProfilePumpThreadId = 0xFFFF0001u;
+void profile_host_thread_started(uint32_t thread_id) {
+    if (g_options.profile.empty() && !g_options.profile_guest) return;
+    HANDLE h = nullptr;
+    if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
+                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0)) {
+        std::lock_guard<std::mutex> lock(g_profile_mutex);
+        g_profile_threads.push_back({thread_id, h});
+    }
+}
+
 // Host function containing `pc` from the harness PDB (build_native_boot.py --debug-info) or a
 // system module's exports, or "" (no symbols). Only the sampler thread calls it (DbgHelp is
 // single-threaded); results are cached per PC.
@@ -1225,6 +1239,8 @@ void finish_profile() {
     std::fprintf(stderr, "[harness] thread profile written to %s\n", g_options.profile.c_str());
 }
 #else
+constexpr uint32_t kProfilePumpThreadId = 0xFFFF0001u;
+void profile_host_thread_started(uint32_t) {}
 void profile_thread_started(uint32_t) {}
 void start_profile() {}
 void finish_profile() {}
@@ -1390,6 +1406,7 @@ bool start_live_window() {
     std::string error;
     const bool ok = g_live.start(
         [options](std::string* err) -> std::unique_ptr<ne::NativeExecutor> {
+            profile_host_thread_started(kProfilePumpThreadId);  // the factory runs on the pump thread
             ne::NativeExecutor::CreateStatus status;
             auto exec = ne::NativeExecutor::create(options, &status, err);
             if (exec) {
