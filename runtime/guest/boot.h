@@ -607,6 +607,11 @@ bool report_host_fault(const char* kind, uint64_t host_address, uint64_t host_pc
 // and the harness writes the normal report. Sticky until the process ends.
 void request_boot_stop();
 
+// Like request_boot_stop, for a host-side failure the run cannot continue past (e.g. the native
+// executor's unrecoverable GPU device loss): the boot stops at its next dispatch with status fault,
+// fault kind `kind` (a string literal) and `message`, instead of a clean stop_requested bound.
+void request_boot_stop_fault(const char* kind, const std::string& message);
+
 // Called on the faulting thread at the end of capturing a fault record (guest traps, unresolved
 // imports, indirect misses ...) with the fault_record JSON object, so the harness can write a
 // minidump while that thread's stack is still live. Null clears it.

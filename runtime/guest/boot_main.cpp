@@ -1229,6 +1229,7 @@ std::atomic<bool> g_window_focused{true};
 std::atomic<playgta6::guest::host_input::HostInputSource*> g_host_source{nullptr};
 std::mutex g_live_final_mutex;
 std::string g_live_final_stats = "null";  // the executor's stats_json, captured when the pump stops
+std::string g_live_fatal;  // non-empty: the executor stopped on an unrecoverable fault (under g_live_final_mutex)
 std::atomic<bool> g_live_deadline_active{false};
 std::atomic<bool> g_live_stats_active{false};  // the 5 s [live] fps line thread  // the --max-ms watcher thread of a live run
 std::atomic<bool> g_guest_faulted{false};  // set before the window is held open on a fault
@@ -1367,6 +1368,10 @@ bool start_live_window() {
     g_live.set_finish_hook([](ne::NativeExecutor& exec) {
         std::lock_guard<std::mutex> lock(g_live_final_mutex);
         g_live_final_stats = exec.stats_json();
+        if (exec.faulted()) {
+            const std::string lost = exec.stats().device_lost_message;
+            g_live_fatal = "GPU device lost and not recoverable" + (lost.empty() ? std::string() : " (" + lost + ")");
+        }
     });
     std::string error;
     const bool ok = g_live.start(
@@ -1391,6 +1396,18 @@ bool start_live_window() {
             return exec;
         },
         [] {
+            // poll() is false for a closed window and for an executor that cannot continue (a device loss
+            // it could not recover from): the latter is a fault, not a clean stop_requested bound.
+            std::string fatal;
+            {
+                std::lock_guard<std::mutex> lock(g_live_final_mutex);
+                fatal = g_live_fatal;
+            }
+            if (!fatal.empty()) {
+                std::fprintf(stderr, "[harness] native executor fatal: %s: stopping the boot\n", fatal.c_str());
+                guest::request_boot_stop_fault("gpu_device_lost", fatal);
+                return;
+            }
             std::fprintf(stderr, "[harness] window closed: stopping the boot\n");
             guest::request_boot_stop();
         },

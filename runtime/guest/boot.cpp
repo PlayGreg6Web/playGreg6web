@@ -83,6 +83,9 @@ uint64_t host_stage_reflection_bytes() { return g_host_stage_reflection_bytes.lo
 
 namespace {
 std::atomic<bool> g_stop_requested{false};  // request_boot_stop
+std::atomic<const char*> g_stop_fault_kind{nullptr};  // request_boot_stop_fault (string literal)
+std::mutex g_stop_fault_mutex;
+std::string g_stop_fault_message;  // under g_stop_fault_mutex
 
 using os::PageProtect;
 using os::VirtualMemoryArena;
@@ -1215,6 +1218,20 @@ void boot_fault_handler(const FaultInfo* info) {
     stop_boot();
 }
 
+// request_boot_stop_fault: the run ends as a fault of the host-side kind, not as a clean bound.
+void stop_on_host_failure(GuestState* state, const char* kind, uint64_t target) {
+    BootState& b = boot();
+    b.fault_gate.claim_or_park();
+    t_observer.flush_dispatches();
+    capture_fault(kind, state, target, 0);
+    {
+        std::lock_guard<std::mutex> lock(g_stop_fault_mutex);
+        b.message = std::string(kind) + ": " + g_stop_fault_message;
+    }
+    b.status = BootStatus::Fault;
+    stop_boot();
+}
+
 void stop_on_limit(GuestState* state, const char* kind, uint64_t target) {
     BootState& b = boot();
     b.fault_gate.claim_or_park();
@@ -1773,6 +1790,9 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
     }
     if (g_stop_requested.load(std::memory_order_relaxed)) {
         t_observer.flush_dispatches();
+        if (const char* kind = g_stop_fault_kind.load(std::memory_order_acquire)) {
+            stop_on_host_failure(state, kind, target);
+        }
         stop_on_limit(state, "stop_requested", target);
     }
     if (b.max_dispatches != 0) {
@@ -3876,6 +3896,16 @@ bool request_exit(int32_t exit_code) {
 }
 
 void request_boot_stop() { g_stop_requested.store(true, std::memory_order_relaxed); }
+
+void request_boot_stop_fault(const char* kind, const std::string& message) {
+    {
+        std::lock_guard<std::mutex> lock(g_stop_fault_mutex);
+        g_stop_fault_message = message;
+    }
+    const char* expected = nullptr;
+    g_stop_fault_kind.compare_exchange_strong(expected, kind, std::memory_order_acq_rel);  // the first one wins
+    g_stop_requested.store(true, std::memory_order_release);
+}
 
 bool report_host_fault(const char* kind, uint64_t host_address, uint64_t host_pc) {
     BootState& b = boot();

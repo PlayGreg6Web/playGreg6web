@@ -9713,14 +9713,24 @@ struct Entry { dst: u32, first: u32, count: u32, flags: u32 }
             Impl* self;
             int slot;
             size_t count;
+            uint64_t epoch;
         };
-        auto* pend = new Pending{this, e.timer_slot, e.timer_passes * 2};
+        auto* pend = new Pending{this, e.timer_slot, e.timer_passes * 2, submit_epoch};
         TimerSlot& ts = timer_slots[static_cast<size_t>(e.timer_slot)];
         ++pending_maps;
         ts.staging.MapAsync(
             wgpu::MapMode::Read, 0, pend->count * 8, wgpu::CallbackMode::AllowProcessEvents,
             [](wgpu::MapAsyncStatus st, wgpu::StringView, Pending* pd) {
                 Impl& s = *pd->self;
+                // A device loss releases the ring and the slots (release_device_objects) before it delivers the
+                // old device's maps: such a callback, or one landing after a new device built a new ring, has
+                // nothing left to complete (dereferencing the reset ring was a host access violation at 0x8).
+                if (pd->epoch != s.submit_epoch || !s.time_ring || !s.time_table ||
+                    static_cast<size_t>(pd->slot) >= s.timer_slots.size()) {
+                    --s.pending_maps;
+                    delete pd;
+                    return;
+                }
                 TimerSlot& slot = s.timer_slots[static_cast<size_t>(pd->slot)];
                 if (st == wgpu::MapAsyncStatus::Success) {
                     const auto* ticks = static_cast<const uint64_t*>(slot.staging.GetConstMappedRange(0, pd->count * 8));

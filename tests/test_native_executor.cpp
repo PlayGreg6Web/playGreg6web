@@ -2501,6 +2501,28 @@ void test_timers() {
     const std::string json = table.json();
     CHECK(json.find("\"frames_measured\": 3") != std::string::npos);
     std::printf("timer: %llu ns of compute over 3 passes\n", static_cast<unsigned long long>(compute_ns));
+
+    // A device loss with a timed frame's map still in flight: the recovery releases the ring and the slots
+    // before the old device delivers that map (a 435 s boot's host access violation at 0x8 in
+    // GpuTimeRing::abandon). The stale callback is dropped and the new device times frames again.
+    auto timed_frame = [&] {
+        gpu::CommandEncoder frame;
+        frame.begin_frame();
+        frame.set_compute_pipeline(204);
+        set_bind_group2(frame, 0, 205);
+        for (int d = 0; d < 8; ++d) frame.dispatch_compute(64);
+        frame.present();
+        run(*ex, frame);
+    };
+    timed_frame();  // no wait_idle: its timer map is pending
+    const uint64_t frames_before = ex->stats().timer_frames;
+    ex->debug_force_device_lost("simulated hang with a timer map in flight");
+    timed_frame();  // recovers first
+    ex->wait_idle();
+    CHECK(ex->stats().recoveries == 1 && !ex->faulted());
+    timed_frame();
+    ex->wait_idle();
+    CHECK(ex->stats().timer_frames > frames_before);
     ex.reset();  // closes the pack
     std::remove(path.c_str());
 }
