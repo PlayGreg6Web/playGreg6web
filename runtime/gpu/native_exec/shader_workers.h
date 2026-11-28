@@ -78,6 +78,18 @@ public:
         return ready();
     }
 
+    // Device-loss recovery: drops the jobs not started yet and waits for the running ones (every job holds
+    // the lost device, and a D3D12 device is one per adapter: while it lives, the new instance cannot open
+    // the adapter again). The threads keep running. Returns the number of dropped jobs.
+    uint64_t cancel_pending() {
+        std::unique_lock<std::mutex> lock(mu_);
+        const uint64_t dropped = jobs_.size();
+        jobs_.clear();
+        submitted_ -= dropped;
+        done_cv_.wait(lock, [&] { return submitted_ == completed_.load(std::memory_order_acquire) || threads_.empty(); });
+        return dropped;
+    }
+
     // Joins the threads; jobs not started yet are dropped (their shaders never become ready, so only
     // call this when nothing waits for them any more: teardown).
     void stop() {

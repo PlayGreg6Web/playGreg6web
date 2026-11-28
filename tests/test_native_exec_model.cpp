@@ -17,6 +17,7 @@
 #include "gpu/native_exec/binding_access_model.h"
 #include "gpu/native_exec/blit_model.h"
 #include "gpu/native_exec/clear_model.h"
+#include "gpu/native_exec/adapter_model.h"
 #include "gpu/native_exec/binding_fit_model.h"
 #include "gpu/native_exec/error_scope_model.h"
 #include "gpu/native_exec/fragment_outputs_model.h"
@@ -1320,6 +1321,28 @@ void test_shader_workers() {
     CHECK(w.wait([&] { return done.load() == 2; }, kPipeWaitUnlimited));
     CHECK(w.wait([&] { return w.completed() == 2; }, 1000ull * 1000000ull));
     CHECK(w.outstanding() == 0);
+    // Recovery: jobs not started are dropped, a running one is waited for, the workers stay usable.
+    std::atomic<int> started{0};
+    release = false;
+    for (int i = 0; i < 2; ++i)
+        w.submit([&] {
+            ++started;
+            while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            ++done;
+        });
+    while (started.load() < 2) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    for (int i = 0; i < 3; ++i) w.submit([&] { ++done; });
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        release = true;
+    });
+    const uint64_t dropped = w.cancel_pending();
+    releaser.join();
+    CHECK(dropped == 3);  // two workers ran the two blocking jobs; the three queued ones were dropped
+    CHECK(done.load() == 4);
+    CHECK(w.outstanding() == 0);
+    w.submit([&] { ++done; });
+    CHECK(w.wait([&] { return done.load() == 5; }, 1000ull * 1000000ull));
     w.stop();
     CHECK(!w.running());
 }
@@ -1580,6 +1603,18 @@ uint64_t copied_bytes(const std::vector<ZeroCopy>& copies) {
     return n;
 }
 
+void test_adapter_model() {
+    const AdapterIdentity gpu{"d3d12", 0x10de, 0x2783, false, "NVIDIA GeForce RTX 4070 SUPER"};
+    const AdapterIdentity warp{"d3d12", 0x1414, 0x8c, true, "Microsoft Basic Render Driver"};
+    CHECK(same_adapter(gpu, gpu));
+    CHECK(!same_adapter(gpu, warp));  // the CPU adapter a new instance hands out while the GPU is not open
+    AdapterIdentity other = gpu;
+    other.description = "renamed";
+    CHECK(same_adapter(gpu, other));  // the description is for the log only
+    other.backend = "vulkan";
+    CHECK(!same_adapter(gpu, other));
+    CHECK(same_adapter(warp, warp));  // --adapter warp runs stay on WARP
+}
 void test_gpu_stall_watch() {
     constexpr uint64_t ms = 1000000ull;
     GpuStallWatch w(8000 * ms);
@@ -2061,6 +2096,7 @@ int main() {
     test_view_alias_model();
     test_clear_model();
     test_gpu_stall_watch();
+    test_adapter_model();
     test_usage_scope_model();
     test_binding_access_model();
     if (g_failures) {
