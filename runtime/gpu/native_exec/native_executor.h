@@ -148,6 +148,15 @@ struct ExecutorOptions {
     // swapchain image. Read-only, the guest's frame is unchanged. Empty = off. With a window F7 / F8 / F9 /
     // F10 (mip, layer, previous, next target) take over; set_show_target changes it at run time.
     std::string show_target;
+    // --dump-targets-at N[,N...] (target_dump_model.h): at these 0-based presents every render target the frame drew
+    // to (each colour attachment and the depth of every render pass) and every storage texture a dispatch wrote is
+    // drawn raw into an rgba16float copy (at most dump_targets_max_dim on its larger side) and written as
+    // <dump_targets_dir>/present-<N>/<pass>-tex-<id>[...].png (scaled by its own max) plus index.txt: per target
+    // its format / size, value stats (BLACK / FLAT / ok, max, mean, NaN) and the draws / dispatches that ran and
+    // were skipped from that pass to the next. Empty dir: <screenshot dir>/targets. Read-only like show_target.
+    std::vector<uint64_t> dump_targets_at;
+    std::string dump_targets_dir;
+    uint32_t dump_targets_max_dim = 640;
     // On-screen stats overlay (overlay_model.h) at start; F3 toggles it in a window, set_overlay() at run time.
     // Drawn after every copy of the guest's frame: digests and screenshots are unchanged.
     bool overlay = false;
@@ -210,6 +219,7 @@ struct ExecutorStats {
     uint64_t quarantine_skips = 0;           // draws / dispatches skipped by the shader quarantine (also in the drop table)
     uint64_t show_target_frames = 0;         // presents that drew the --show-target texture instead of the swapchain image
     uint64_t show_target_unavailable = 0;    // presents where the chosen target could not be shown (the swapchain image stays)
+    uint64_t targets_dumped = 0, targets_dump_failed = 0;  // --dump-targets-at PNGs written / targets that could not be
     // Milestone 1 (resources, pipelines, draws). "packet errors" are the worker's `_packetError`
     // (a v2 / texture packet it rejects); op errors above are its `_recordOpValidationError`.
     uint64_t packet_errors = 0;

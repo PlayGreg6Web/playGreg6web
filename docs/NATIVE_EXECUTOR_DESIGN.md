@@ -299,6 +299,18 @@ and is not read by the guest unless it already would be. Not shown, reported in 
 GPU tests: `tests/test_native_executor.cpp` (`test_show_target*`: colour, layers, mips, msaa, depth ranges,
 pass selectors, hotkey cycling, digest equality with and without the option).
 
+**Every target of a frame: `--dump-targets-at N[,N...]`** (`ExecutorOptions::dump_targets_at`, `dump_targets_dir`,
+`dump_targets_max_dim` 640; model `runtime/gpu/native_exec/target_dump_model.h`). While a listed present is built the
+executor notes each render pass (all texture colour attachments, the depth attachment, the draw / dispatch / skip
+counters when it began) and the storage textures the executed dispatches bind writable. At the present, after the digest
+and screenshot copies, each distinct target is drawn with the display shader in raw mode (`mode.y = 1`: the texel as it
+is, depth through its r32float twin) into an rgba16float copy at most 640 px on its larger side, read back
+asynchronously and written as `present-N/pass-PPP-tex-ID[-depth|-storage][-cK].png` (scaled by its own max) plus
+`index.txt`: per pass the work that ran / was skipped up to the next pass, per target format, size, `BLACK` / `FLAT` /
+`ok`, max, mean, alpha range, NaN / inf counts. Contents are those at the present (a target rewritten later in the frame
+shows its last state). Same read-only rule and the same unsupported cases as `--show-target`. Stats: `targets_dumped`,
+`targets_dump_failed`. Tests: `test_target_dump_model` (model), `test_dump_targets` (GPU).
+
 ## Threading
 
 - **M0:** single-threaded. The executor, its device and its window belong to the thread that

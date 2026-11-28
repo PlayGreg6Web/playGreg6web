@@ -5177,6 +5177,77 @@ void test_pipeline_pass_formats(NativeExecutor& ex) {
     CHECK(after.pipeline_variants_created == before.pipeline_variants_created + 2);
 }
 
+// --dump-targets-at: at present 1 every render target of the frame is written as a PNG with an index line; a
+// cleared-black target is reported BLACK, a green one ok and green in its PNG, a depth target through its twin.
+void test_dump_targets() {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "pg6_dump_targets_gpu_test";
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    opts.dump_targets_at = {1};
+    opts.dump_targets_dir = dir.string();
+    opts.dump_targets_max_dim = 32;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    if (!ex) {
+        CHECK(status == NativeExecutor::CreateStatus::NoAdapter);
+        return;
+    }
+    for (int i = 0; i < 3; ++i) {
+        gpu::CommandEncoder e;
+        e.begin_frame();
+        if (i == 0) {
+            emit(e, GpuOpcode::CreateTexture2, bytes_of(show_texture(100, 22)));
+            emit(e, GpuOpcode::CreateTexture2, bytes_of(show_texture(101, 22)));
+            emit(e, GpuOpcode::CreateTexture2, bytes_of(show_texture(103, 48)));
+        }
+        end_pass(e, texture_pass(100, 0, 1, 0, 1));  // pass 0: green
+        end_pass(e, texture_pass(101, 0, 0, 0, 0));  // pass 1: black
+        GpuBeginRenderPassPayload dp;                // pass 2: depth only, 0.5
+        std::memset(&dp, 0, sizeof dp);
+        dp.depth_stencil.texture_id = 103;
+        dp.depth_stencil.depth_load_op = static_cast<uint8_t>(GpuLoadOp::Clear);
+        dp.depth_stencil.depth_store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+        dp.depth_stencil.depth_clear_value = 0.5f;
+        end_pass(e, dp);
+        end_pass(e, swapchain_pass(GpuLoadOp::Clear, 1, 0, 0, 1));  // pass 3: the swapchain
+        e.present();
+        run(*ex, e);
+    }
+    ex->wait_idle();
+    CHECK(ex->stats().targets_dumped == 3 && ex->stats().targets_dump_failed == 0);
+    CHECK(frame_is(*ex, {0, 0, 255, 255}));  // the guest's frame is untouched
+    std::ifstream idx(dir / "present-1" / "index.txt", std::ios::binary);
+    const std::string text((std::istreambuf_iterator<char>(idx)), std::istreambuf_iterator<char>());
+    CHECK(text.find("present 1: 4 render passes") == 0);
+    CHECK(text.find("pass 3 (swapchain)") != std::string::npos);
+    const size_t p0 = text.find("colour 0 tex 100 rgba8unorm 64x32");
+    CHECK(p0 != std::string::npos && text.find("FLAT", p0) < text.find('\n', p0));
+    const size_t p1 = text.find("colour 0 tex 101 ");
+    CHECK(p1 != std::string::npos && text.find("BLACK", p1) < text.find('\n', p1));
+    const size_t p2 = text.find("depth tex 103 depth");
+    CHECK(p2 != std::string::npos && text.find("rgb max 0.5", p2) < text.find('\n', p2));
+    CHECK(text.find("pass-002-tex-103-depth.png") != std::string::npos);
+    std::ifstream in(dir / "present-1" / "pass-000-tex-100.png", std::ios::binary);
+    std::vector<uint8_t> png((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    uint32_t w = 0, h = 0;
+    std::vector<uint8_t> rgb;
+    CHECK(png_test_decode_rgb(png, &w, &h, &rgb));
+    CHECK(w == 32 && h == 16 && rgb.size() == size_t{w} * h * 3);
+    bool green = !rgb.empty();
+    for (size_t i = 0; i + 2 < rgb.size(); i += 3) green = green && rgb[i] == 0 && rgb[i + 1] == 255 && rgb[i + 2] == 0;
+    CHECK(green);
+    CHECK(!std::filesystem::exists(dir / "present-0") && !std::filesystem::exists(dir / "present-2"));
+    CHECK(ex->stats().device_errors == 0);
+    ex.reset();
+    in.close();
+    idx.close();
+    std::filesystem::remove_all(dir, ec);
+}
+
 int main() {
     ExecutorOptions opts;
     opts.width = kW;
@@ -5234,6 +5305,7 @@ int main() {
     test_show_target_bad_option();
     test_destroyed_texture_leaves_caches();
     test_bind_group_budget();
+    test_dump_targets();
     test_device_loss();
     test_device_loss_journal();
     test_async_pipelines_and_blob_cache();

@@ -12,6 +12,8 @@
 // --dump-frame 0,10,...  headless: write those frames' swapchain image as <dump-dir>/frame-<N>.png (the screenshot
 //               PNG encoder, gpu/native_exec/screenshot_model.h; tools/native_replay_compare.py diffs these)
 // --dump-dir D  where --dump-frame writes (default: the current directory)
+// --dump-targets-at 0,10,... [--dump-targets-dir D]  write every render / storage target of those presents as PNG +
+//               index.txt (value stats, draws run / skipped per pass) into D/present-N (gpu/native_exec/target_dump_model.h)
 // --window      present to a native window (Win32) instead; closing it stops the replay
 // --show-target <selector>  present this render target / texture instead of the swapchain image (read-only
 //               diagnostic for black / garbled screens): <id>, tex:ID, depth:ID, pass:N[:depth], last, cycle, with
@@ -123,6 +125,11 @@ int main(int argc, char** argv) {
             if (!parse_list(v, &dump_at)) return usage();
         } else if (a == "--dump-dir" && (v = next())) {
             dump_dir = v;
+        } else if (a == "--dump-targets-at" && (v = next())) {
+            std::string err;
+            if (!parse_screenshot_at(v, &opts.dump_targets_at, &err)) return usage();
+        } else if (a == "--dump-targets-dir" && (v = next())) {
+            opts.dump_targets_dir = v;
         } else if (a == "--size" && (v = next())) {
             unsigned w = 0, h = 0;
             if (std::sscanf(v, "%ux%u", &w, &h) != 2 || !w || !h) return usage();

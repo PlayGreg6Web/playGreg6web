@@ -32,6 +32,7 @@
 #include "gpu/native_exec/shader_workers.h"
 #include "gpu/native_exec/show_target_model.h"
 #include "gpu/native_exec/stream_model.h"
+#include "gpu/native_exec/target_dump_model.h"
 #include "gpu/native_exec/usage_scope_model.h"
 
 namespace {
@@ -1838,6 +1839,52 @@ void test_memory_model() {
     CHECK(rs.empty());
 }
 
+// --dump-targets-at: output size, half read-back, value stats, auto-scaled PNG pixels, names.
+void test_target_dump_model() {
+    DumpExtent d = target_dump_extent(1920, 1080, 640);
+    CHECK(d.w == 640 && d.h == 360);
+    d = target_dump_extent(100, 50, 640);
+    CHECK(d.w == 100 && d.h == 50);
+    d = target_dump_extent(4, 4096, 640);
+    CHECK(d.w == 1 && d.h == 640);
+    d = target_dump_extent(0, 0, 0);
+    CHECK(d.w == 1 && d.h == 1);
+
+    CHECK(dump_half_to_float(0x3C00) == 1.0f && dump_half_to_float(0xC000) == -2.0f && dump_half_to_float(0) == 0.0f);
+    CHECK(std::isnan(dump_half_to_float(0x7E00)) && std::isinf(dump_half_to_float(0x7C00)));
+    CHECK(std::fabs(dump_half_to_float(0x0001) - std::ldexp(1.0f, -24)) < 1e-12f);
+    const uint16_t row[2][4] = {{0x3C00, 0x3800, 0, 0x3C00}, {0, 0, 0, 0}};  // (1, 0.5, 0, 1), (0, 0, 0, 0)
+    std::vector<uint8_t> padded(256 + 16, 0);
+    std::memcpy(padded.data(), row[0], 8);
+    std::memcpy(padded.data() + 256, row[1], 8);
+    std::vector<float> px = dump_rgba16f_to_float(padded.data(), 256, 1, 2);
+    CHECK(px.size() == 8 && px[0] == 1.0f && px[1] == 0.5f && px[3] == 1.0f && px[4] == 0.0f);
+
+    TargetDumpStats s = target_dump_stats(px.data(), 2);
+    CHECK(!s.black() && !s.flat() && s.nonzero_rgb == 1 && s.max_rgb == 1.0f && s.mean[1] == 0.25);
+    CHECK(target_dump_stats_text(s).find("ok nonzero 50.0%") == 0);
+    const std::vector<float> zero(4 * 3, 0.0f);
+    s = target_dump_stats(zero.data(), 3);
+    CHECK(s.black() && s.flat() && target_dump_stats_text(s).find("BLACK") == 0);
+    std::vector<uint8_t> rgb = target_dump_rgb8(zero.data(), 3, s.max_rgb);
+    CHECK(rgb.size() == 9 && rgb[0] == 0 && rgb[8] == 0);
+    // HDR / dim targets are scaled by their own max; NaN is counted, not averaged.
+    const float hdr[8] = {8.0f, 2.0f, 0.0f, 1.0f, std::nanf(""), 0.0f, 0.0f, 1.0f};
+    s = target_dump_stats(hdr, 2);
+    CHECK(s.nan == 1 && s.max_rgb == 8.0f && s.mean[0] == 8.0);
+    rgb = target_dump_rgb8(hdr, 2, s.max_rgb);
+    CHECK(rgb[0] == 255 && rgb[1] == 64 && rgb[2] == 0 && rgb[3] == 0);
+    const float dim[4] = {0.002f, 0.001f, 0.0f, 1.0f};
+    s = target_dump_stats(dim, 1);
+    rgb = target_dump_rgb8(dim, 1, s.max_rgb);
+    CHECK(rgb[0] == 255 && rgb[1] >= 127 && rgb[1] <= 128);
+
+    CHECK(target_dump_stem(7, 1234, "", 0) == "pass-007-tex-1234");
+    CHECK(target_dump_stem(12, 5, "depth", 0) == "pass-012-tex-5-depth");
+    CHECK(target_dump_stem(3, 9, "", 2) == "pass-003-tex-9-c2");
+    CHECK(show_target_wgsl(false).find("u.mode.y == 1u") != std::string::npos);
+}
+
 int main() {
     test_memory_model();
     test_present_model();
@@ -1860,6 +1907,7 @@ int main() {
     test_layout_remap();
     test_blit_model();
     test_show_target_model();
+    test_target_dump_model();
     test_pipe_wait_budget();
     test_shader_workers();
     test_remap_bindings_match();

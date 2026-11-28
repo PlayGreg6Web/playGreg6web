@@ -299,6 +299,13 @@ reverse-Z or tight depth), `@layer=2`, `@mip=1`. Offline: `pg6_native_exec --tra
 --digest-at 30` runs headless and the digest / non-black counts it prints are those of the shown target (the headless swapchain).
 Details: `docs/NATIVE_EXECUTOR_DESIGN.md`, "Present any target".
 
+Headless, all targets at once: `--dump-targets-at 2450,2500` (with `--live-executor` or `--window`, also
+`pg6_native_exec`) writes every render target of those presents (each colour attachment and the depth of every pass)
+and every storage texture a dispatch wrote as PNGs into `<screenshot dir>/targets/present-N/` (`--dump-targets-dir D`).
+`index.txt` there lists each pass with the draws / dispatches that ran and were skipped (pipeline failed / pending, usage
+scope) up to the next pass, and per target `BLACK` / `FLAT` / `ok`, its max and mean: the first `BLACK` stage is where
+to look. PNGs are scaled by the target's own max, so dim HDR targets stay visible.
+
 ## One boot at a time: the machine-wide boot lock
 
 `tools/run_native_boot.py` (and so `play_local.ps1` and the `update_prebuilt.ps1` smoke gate) takes a lock file,

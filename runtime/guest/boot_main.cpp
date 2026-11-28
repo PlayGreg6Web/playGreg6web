@@ -72,6 +72,9 @@
 //   --live-digest <file>  (with --window, tools/live_vs_replay.py) per-frame replay digests of the live executor
 //   --screenshot-at N[,N...]  with --window: save those present indices (0-based) as PNG; F12 saves the current frame
 //                to %LOCALAPPDATA%\playgta6\screenshots
+//   --dump-targets-at N[,N...] [--dump-targets-dir D]  (with --window / --live-executor) at those presents write every render
+//                target and dispatch-written storage texture of the frame as PNG + index.txt (value stats, draws run / skipped
+//                per pass) into D/present-N (default <screenshot dir>/targets; gpu/native_exec/target_dump_model.h)
 //   --present-mode auto|fifo|mailbox|immediate / --max-fps N (0 = off)  with --window: surface present mode, host-side cap
 //   --overlay            (with --window) start with the on-screen stats overlay on (F3 toggles it, rebindable [hotkeys] overlay; gpu/native_exec/overlay_model.h)
 //   --show-target <selector>  (with --window) present a render target / texture instead of the swapchain image (read-only; Ctrl+F7 mip, Ctrl+F8 layer, Ctrl+F9/F10 target, rebindable in keymap.ini [hotkeys]; gpu/native_exec/show_target_model.h)
@@ -307,6 +310,8 @@ struct Options {
     playgta6::gpu::native_exec::PresentChoice present_mode = playgta6::gpu::native_exec::PresentChoice::Auto;  // --present-mode
     uint32_t max_fps = 0;           // --max-fps: host-side present cap (0 = off)
     std::vector<uint64_t> screenshot_at;  // --screenshot-at: present indices saved as PNG (F12 always works)
+    std::vector<uint64_t> dump_targets_at;  // --dump-targets-at: presents whose render / storage targets are dumped
+    std::string dump_targets_dir;   // --dump-targets-dir
     bool host_input = false;        // --host-input: real XInput pad + keyboard (guest/host_input.h)
     std::string keymap_file;        // --keymap: key/mouse rebinding file for --host-input (guest/keymap.h)
     std::string record_input;       // --record-input: write the real --host-input readings (guest/input_record.h)
@@ -502,6 +507,14 @@ bool parse(int argc, char** argv, Options& o) {
                 std::fprintf(stderr, "%s\n", err.c_str());
                 return false;
             }
+        } else if (a == "--dump-targets-at" && i + 1 < argc) {
+            std::string err;
+            if (!playgta6::gpu::native_exec::parse_screenshot_at(argv[++i], &o.dump_targets_at, &err)) {
+                std::fprintf(stderr, "--dump-targets-at: %s\n", err.c_str());
+                return false;
+            }
+        } else if (a == "--dump-targets-dir" && i + 1 < argc) {
+            o.dump_targets_dir = argv[++i];
         } else if (a == "--test-stall") {
             o.test_stall = true;
         } else if (a == "--test-stall-report") {  // implies --test-stall
@@ -1329,6 +1342,8 @@ bool start_live_window() {
     options.overlay = g_options.overlay;
     options.max_fps = g_options.max_fps;
     options.screenshot_at = g_options.screenshot_at;
+    options.dump_targets_at = g_options.dump_targets_at;
+    options.dump_targets_dir = g_options.dump_targets_dir;
     // Persistent Dawn blob cache per title / Dawn build / adapter (repeat runs skip the DXC and driver
     // compiles), and pipelines compiled on Dawn's worker threads while the pump keeps consuming packets.
     if (g_options.dawn_cache != "off") {
