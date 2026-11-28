@@ -20,6 +20,7 @@
 #include "gpu/native_exec/binding_fit_model.h"
 #include "gpu/native_exec/error_scope_model.h"
 #include "gpu/native_exec/fragment_outputs_model.h"
+#include "gpu/native_exec/gpu_stall_model.h"
 #include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/memory_model.h"
@@ -1511,6 +1512,32 @@ uint64_t copied_bytes(const std::vector<ZeroCopy>& copies) {
     return n;
 }
 
+void test_gpu_stall_watch() {
+    constexpr uint64_t ms = 1000000ull;
+    GpuStallWatch w(8000 * ms);
+    CHECK(!w.sample(0, 0, 1 * ms));            // idle
+    CHECK(!w.sample(3, 0, 10 * ms));           // work pending: the clock starts
+    CHECK(!w.sample(3, 1, 5000 * ms));         // progress restarts it
+    CHECK(!w.sample(3, 1, 12000 * ms));        // 7 s without progress: not yet
+    CHECK(w.stalled_ns(12000 * ms) == 7000 * ms);
+    CHECK(w.sample(3, 1, 13001 * ms));         // > 8 s: remove the device
+    CHECK(!w.sample(3, 1, 20000 * ms));        // once per stall
+    CHECK(!w.sample(3, UINT64_MAX, 20100 * ms));  // removed: the fence reports UINT64_MAX, idle again
+    CHECK(w.stalled_ns(20100 * ms) == 0);
+    CHECK(!w.sample(5, 3, 30000 * ms));        // a new stall needs its own 8 s
+    CHECK(!w.sample(5, 3, 37000 * ms));
+    CHECK(w.sample(5, 3, 38001 * ms));
+    w.reset();
+    CHECK(!w.sample(1, 0, 40000 * ms));
+    GpuStallWatch off(0);
+    CHECK(!off.sample(1, 0, 0));
+    CHECK(!off.sample(1, 0, UINT64_MAX / 2));
+    CHECK(gpu_stall_threshold_ns(nullptr) == kDefaultGpuStallNs);
+    CHECK(gpu_stall_threshold_ns("0") == 0);
+    CHECK(gpu_stall_threshold_ns("2500") == 2500 * ms);
+    CHECK(gpu_stall_threshold_ns("x") == kDefaultGpuStallNs);
+    CHECK(gpu_stall_threshold_ns("-1") == kDefaultGpuStallNs);
+}
 void test_clear_model() {
     // 8x8 rgba8 with 4 mips, nothing written: every texel of every mip, one copy per mip.
     ClearGeometry g;
@@ -1965,6 +1992,7 @@ int main() {
     test_binding_fit();
     test_view_alias_model();
     test_clear_model();
+    test_gpu_stall_watch();
     test_usage_scope_model();
     test_binding_access_model();
     if (g_failures) {

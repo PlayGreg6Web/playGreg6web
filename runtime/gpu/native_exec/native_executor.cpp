@@ -6,8 +6,15 @@
 #include <webgpu/webgpu_cpp.h>
 
 #include <dawn/native/DawnNative.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX  // windows.h (through d3d12.h) must not define min / max over std::min / std::max
+#endif
+#include <dawn/native/D3D12Backend.h>  // the GPU stall breaker's fence and RemoveDevice (gpu_stall_model.h)
+#endif
 
 #include <algorithm>
+#include <condition_variable>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -41,6 +48,7 @@
 #include "gpu/native_exec/view_alias_model.h"
 #include "gpu/native_exec/error_scope_model.h"
 #include "gpu/native_exec/fragment_outputs_model.h"
+#include "gpu/native_exec/gpu_stall_model.h"
 #include "gpu/native_exec/layout_model.h"
 #include "gpu/native_exec/m1_model.h"
 #include "gpu/native_exec/memory_model.h"
@@ -712,6 +720,99 @@ struct NativeExecutor::Impl {
     uint64_t frame_count = 0;
     std::atomic<bool> lost{false};  // set by Dawn's device-lost callback (any thread)
     bool blob_cache_opened = false;
+
+    // ---- GPU stall breaker (gpu_stall_model.h) ----
+    // A fence of our own is signaled on Dawn's D3D12 queue after every tracked submit; a watcher thread
+    // removes the device once the GPU has completed nothing for the threshold, so Dawn's Submit stops
+    // waiting for a command allocator and the device-loss recovery runs instead of the title's watchdog.
+    std::atomic<uint64_t> gpu_stall_removals{0};
+    std::atomic<uint64_t> gpu_stall_max_ns{0};
+    uint64_t gpu_stall_threshold = gpu_stall_threshold_ns(std::getenv("PG6_GPU_STALL_MS"));
+#ifdef _WIN32
+    std::mutex stall_mu;
+    std::condition_variable stall_cv;
+    std::thread stall_thread;
+    bool stall_stop = false;
+    GpuStallWatch stall_watch{gpu_stall_threshold};
+    Microsoft::WRL::ComPtr<ID3D12Device> stall_device;
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> stall_queue;
+    Microsoft::WRL::ComPtr<ID3D12Fence> stall_fence;
+    uint64_t stall_signaled = 0;
+#endif
+
+    // After a device was made: its D3D12 objects and a new fence (D3D12 backend only); starts the watcher.
+    void stall_attach() {
+#ifdef _WIN32
+        if (gpu_stall_threshold == 0 || !device || adapter.backend != "d3d12") return;
+        Microsoft::WRL::ComPtr<ID3D12Device> d3d = dawn::native::d3d12::GetD3D12Device(device.Get());
+        Microsoft::WRL::ComPtr<ID3D12CommandQueue> cq = dawn::native::d3d12::GetD3D12CommandQueue(device.Get());
+        Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+        if (!d3d || !cq || FAILED(d3d->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) return;
+        {
+            std::lock_guard<std::mutex> lock(stall_mu);
+            stall_device = std::move(d3d);
+            stall_queue = std::move(cq);
+            stall_fence = std::move(fence);
+            stall_signaled = 0;
+            stall_watch.reset();
+        }
+        if (!stall_thread.joinable()) stall_thread = std::thread([this] { stall_loop(); });
+#endif
+    }
+    // Before the device goes (recovery release, teardown): the watcher lets go of its D3D12 objects.
+    void stall_detach() {
+#ifdef _WIN32
+        std::lock_guard<std::mutex> lock(stall_mu);
+        stall_fence.Reset();
+        stall_queue.Reset();
+        stall_device.Reset();
+        stall_signaled = 0;
+        stall_watch.reset();
+#endif
+    }
+    void stall_shutdown() {
+#ifdef _WIN32
+        {
+            std::lock_guard<std::mutex> lock(stall_mu);
+            stall_stop = true;
+        }
+        stall_cv.notify_all();
+        if (stall_thread.joinable()) stall_thread.join();
+        stall_detach();
+#endif
+    }
+    // On the executor thread, right after a tracked queue.Submit (Dawn has executed and signaled it).
+    void stall_signal() {
+#ifdef _WIN32
+        std::lock_guard<std::mutex> lock(stall_mu);
+        if (stall_queue && stall_fence) stall_queue->Signal(stall_fence.Get(), ++stall_signaled);
+#endif
+    }
+#ifdef _WIN32
+    void stall_loop() {
+        playgta6::os::name_this_thread(L"pg6-gpu-stall");
+        std::unique_lock<std::mutex> lock(stall_mu);
+        while (!stall_stop) {
+            stall_cv.wait_for(lock, std::chrono::milliseconds(250));
+            if (stall_stop || !stall_fence) continue;
+            const uint64_t completed = stall_fence->GetCompletedValue();
+            const uint64_t t = now_ns();
+            const bool fire = stall_watch.sample(stall_signaled, completed, t);
+            const uint64_t stalled = stall_watch.stalled_ns(t);
+            if (stalled > gpu_stall_max_ns.load()) gpu_stall_max_ns.store(stalled);
+            if (!fire) continue;
+            Microsoft::WRL::ComPtr<ID3D12Device5> d5;
+            if (FAILED(stall_device.As(&d5))) continue;
+            std::fprintf(stderr,
+                         "[native_exec] GPU stall: nothing completed for %llu ms (fence %llu of %llu): removing the "
+                         "device so the recovery runs\n",
+                         static_cast<unsigned long long>(stalled / 1000000ull),
+                         static_cast<unsigned long long>(completed), static_cast<unsigned long long>(stall_signaled));
+            ++gpu_stall_removals;
+            d5->RemoveDevice();
+        }
+    }
+#endif
 
     // Swapchain: an offscreen texture headless, a configured surface with a window.
     std::unique_ptr<NativeWindow> window;
@@ -1415,6 +1516,7 @@ struct NativeExecutor::Impl {
         }
         if (!surface) create_offscreen();
         if (options.gpu_timing) setup_timers(adapter_handle.HasFeature(wgpu::FeatureName::TimestampQuery));
+        stall_attach();
         *status = CreateStatus::Ok;
         return true;
     }
@@ -2988,6 +3090,7 @@ struct NativeExecutor::Impl {
         if (surface && surface_configured) surface.Unconfigure();
         surface_configured = false;
         const uint64_t t2 = now_ns();
+        stall_detach();
         if (device) device.Destroy();
         const uint64_t t3a = now_ns();
         device = nullptr;
@@ -3314,6 +3417,7 @@ struct NativeExecutor::Impl {
         if (inflight.size() >= 64) inflight.pop_front();
         inflight.push_back(f);
         ++stats.submits_tracked;
+        stall_signal();
         struct Done {
             Impl* self;
             uint64_t epoch;
@@ -10914,6 +11018,7 @@ NativeExecutor::NativeExecutor(std::unique_ptr<Impl> impl) : impl_(std::move(imp
 NativeExecutor::~NativeExecutor() {
     if (impl_) impl_->shot_join();
     if (impl_) impl_->shader_workers.stop();  // before the device goes: a running compile finishes first
+    if (impl_) impl_->stall_shutdown();       // the watcher must not remove a device that is being torn down
     if (impl_ && impl_->device) {
         impl_->pass_cmds.clear();
         impl_->buffers.clear();
@@ -11157,6 +11262,9 @@ std::string NativeExecutor::stats_json() const {
     num("recovery_instance_resets", st.recovery_instance_resets);
     num("recovery_bind_groups_deferred", st.recovery_bind_groups_deferred);
     num("debug_gpu_hangs", st.debug_gpu_hangs);
+    num("gpu_stall_removals", impl_->gpu_stall_removals.load());
+    num("gpu_stall_max_ms", impl_->gpu_stall_max_ns.load() / 1000000ull);
+    num("gpu_stall_threshold_ms", impl_->gpu_stall_threshold / 1000000ull);
     if (!st.recovery_timeline.empty()) j += "\"recovery_timeline\": " + st.recovery_timeline + ", ";
     num("submit_gpu_max_frame", st.submit_gpu_max_frame);
     num("draws_clamped", st.draws_clamped);
