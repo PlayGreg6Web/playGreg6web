@@ -630,6 +630,29 @@ pub struct ShardDispatch<'a> {
     pub external_entries: &'a HashSet<u64>,
 }
 
+// Only lines containing an opening brace can match an untagged definition.
+// Skip the rest of each such line after inspecting it, even if it has many braces.
+fn has_untagged_definition(text: &str) -> bool {
+    let mut remaining = text;
+    while let Some(brace) = remaining.find('{') {
+        let line_start = remaining[..brace].rfind('\n').map_or(0, |i| i + 1);
+        let end = remaining[brace..].find('\n').map(|i| brace + i);
+        let mut line = &remaining[line_start..end.unwrap_or(remaining.len())];
+        // str::lines removes a CR only when it precedes a newline.
+        if end.is_some() {
+            line = line.strip_suffix('\r').unwrap_or(line);
+        }
+        if line.starts_with("define ") && line.ends_with(" {") && !line.ends_with(" #0 {") {
+            return true;
+        }
+        match end {
+            Some(i) => remaining = &remaining[i + 1..],
+            None => break,
+        }
+    }
+    false
+}
+
 /// Emits a complete `.ll` module: target info, guest state type, runtime helper declarations,
 /// declarations for called functions that are not part of the module, required intrinsics and
 /// internal helpers, then all function definitions sorted by entry address.
@@ -860,10 +883,7 @@ pub fn emit_module_with_dispatch(
         None => LIFTED_FUNCTION_ATTRIBUTES.to_string(),
         Some(extra) => module_attributes(extra),
     };
-    if out
-        .lines()
-        .any(|l| l.starts_with("define ") && l.ends_with(" {") && !l.ends_with(" #0 {"))
-    {
+    if has_untagged_definition(&out) {
         let mut tagged = String::with_capacity(out.len() + 64);
         for line in out.lines() {
             if line.starts_with("define ") && line.ends_with(" {") && !line.ends_with(" #0 {") {
@@ -887,3 +907,49 @@ pub fn emit_module_with_dispatch(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod attribute_preflight_tests {
+    use super::has_untagged_definition;
+
+    fn reference(text: &str) -> bool {
+        text.lines().any(|line| {
+            line.starts_with("define ") && line.ends_with(" {") && !line.ends_with(" #0 {")
+        })
+    }
+
+    #[test]
+    fn preflight_matches_line_semantics() {
+        let lines = [
+            "",
+            "define void @f() {",
+            "define void @f() #0 {",
+            " define void @f() {",
+            "define x { #0 {",
+            "{ { {",
+            "é{",
+            "define x {\r",
+            "define x {\r\n",
+        ];
+        let endings = ["", "\n", "\r\n", "\r"];
+        for a in lines {
+            for b in lines {
+                for sep in endings {
+                    for end in endings {
+                        let input = format!("{a}{sep}{b}{end}");
+                        assert_eq!(
+                            has_untagged_definition(&input),
+                            reference(&input),
+                            "{input:?}"
+                        );
+                    }
+                }
+            }
+        }
+        let pathological = format!("{}\ndefine x #0 {{\n", "{".repeat(100_000));
+        assert_eq!(
+            has_untagged_definition(&pathological),
+            reference(&pathological)
+        );
+    }
+}
